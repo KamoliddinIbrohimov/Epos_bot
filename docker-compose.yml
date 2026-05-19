@@ -1,0 +1,43 @@
+version: "3.1"
+
+services:
+  db:
+    image: postgres:15
+    container_name: epos_db
+    restart: always
+    environment:
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASS}
+      POSTGRES_DB: ${DB_NAME}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks:
+      - botnet
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${DB_USER} -d $${DB_NAME}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  tgbot:
+    container_name: bot
+    build:
+      context: .
+    command: python3 app.py
+    restart: always
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - botnet
+    env_file:
+      - ".env"
+
+networks:
+  botnet:
+    driver: bridge
+
+volumes:
+  pgdata:

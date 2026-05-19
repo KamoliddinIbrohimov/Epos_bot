@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import ast,sys; [ast.parse\\(open\\(p,encoding='utf-8'\\).read\\(\\),p\\) for p in ['app.py','data/config.py','handlers/users/start.py','keyboards/inline/webapp.py','keyboards/default/admin.py','webapp/server.py']]; print\\('syntax OK'\\)\")"
+    ]
+  }
+}

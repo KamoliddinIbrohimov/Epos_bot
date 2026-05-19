@@ -1,0 +1,728 @@
+import html
+import logging
+import os
+import tempfile
+from datetime import date
+
+import aiohttp
+from aiogram import types
+from aiogram.dispatcher import FSMContext
+from aiogram.dispatcher.filters.state import State, StatesGroup
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.utils.callback_data import CallbackData
+
+from data import config
+from loader import bot, db, dp
+from utils.diller import get_user_diller_name
+from utils.epos_api import EposAPIError, epos_api
+from utils.parse_pdf import PdfParseError, format_analysis, parse_business_pdf
+
+CAPTION_LIMIT = 1024
+
+UPDATABLE_FIELDS = (
+    "name",
+    "owner",
+    "business_type",
+    "diller",
+    "auto_update",
+    "auth_key",
+    "virtual_number",
+    "TIN",
+    "version_info",
+    "status",
+    "price",
+    "pinfl_tin",
+    "blocked_date",
+    "reason",
+)
+
+BRANCH_UPDATABLE_FIELDS = (
+    "name",
+    "address",
+    "contact_person",
+    "contact_phone",
+    "business",
+    "city",
+)
+
+
+class FiscalModule(StatesGroup):
+    waiting_for_factory_id = State()
+    confirming = State()
+
+
+class NewClientClaim(StatesGroup):
+    waiting_for_auth_key = State()
+    confirming = State()
+
+
+fiscal_cb = CallbackData("fisk", "action")
+new_client_cb = CallbackData("newc", "action")
+
+
+def fiscal_confirm_keyboard() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton(
+            "✅ Подтвердить", callback_data=fiscal_cb.new(action="confirm")
+        ),
+        InlineKeyboardButton(
+            "🔄 Отправить заново", callback_data=fiscal_cb.new(action="resend")
+        ),
+    )
+    return kb
+
+
+def new_client_confirm_keyboard() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton(
+            "✅ Подтвердить", callback_data=new_client_cb.new(action="confirm")
+        ),
+        InlineKeyboardButton(
+            "🔄 Отправить заново", callback_data=new_client_cb.new(action="resend")
+        ),
+    )
+    return kb
+
+
+async def get_business(virtual_number, token):
+    """GET /v1/all-business/?virtual_number=... — отдельная функция, токен аргументом."""
+    url = (
+        f"{config.EPOS_API_URL.rstrip('/')}"
+        f"/v1/all-business/?virtual_number={virtual_number}"
+    )
+    headers = {"Authorization": f"Token {token}"}
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url, headers=headers) as resp:
+            text = await resp.text()
+            if resp.status >= 400:
+                raise EposAPIError(f"GET {url} [{resp.status}]: {text}")
+            if not text:
+                return None
+            try:
+                return await resp.json(content_type=None)
+            except (aiohttp.ContentTypeError, ValueError):
+                return text
+
+
+async def update_business(business_id, token, **fields):
+    """
+    PUT /v1/businesses/{business_id}/ — отдельная функция, токен аргументом.
+    Принимает поля бизнеса именованными аргументами, шлёт их JSON-ом.
+    """
+    url = f"{config.EPOS_API_URL.rstrip('/')}/v1/businesses/{business_id}/"
+    headers = {"Authorization": f"Token {token}"}
+    async with aiohttp.ClientSession() as session:
+        async with session.put(url, headers=headers, json=fields) as resp:
+            text = await resp.text()
+            if resp.status >= 400:
+                raise EposAPIError(f"PUT {url} [{resp.status}]: {text}")
+            if not text:
+                return None
+            try:
+                return await resp.json(content_type=None)
+            except (aiohttp.ContentTypeError, ValueError):
+                return text
+
+
+async def update_branch(branch_id, token, **fields):
+    """
+    PUT /v1/branches/{branch_id}/ — отдельная функция, токен аргументом.
+    Поля бранча идут именованными аргументами.
+    """
+    url = f"{config.EPOS_API_URL.rstrip('/')}/v1/branches/{branch_id}/"
+    headers = {"Authorization": f"Token {token}"}
+    async with aiohttp.ClientSession() as session:
+        async with session.put(url, headers=headers, json=fields) as resp:
+            text = await resp.text()
+            if resp.status >= 400:
+                raise EposAPIError(f"PUT {url} [{resp.status}]: {text}")
+            if not text:
+                return None
+            try:
+                return await resp.json(content_type=None)
+            except (aiohttp.ContentTypeError, ValueError):
+                return text
+
+
+async def create_branch(token, **fields):
+    """
+    POST /v1/branches/ — отдельная функция, токен аргументом.
+    Создаёт новый branch для бизнеса. Поля идут именованными аргументами.
+    """
+    url = f"{config.EPOS_API_URL.rstrip('/')}/v1/branches/"
+    headers = {"Authorization": f"Token {token}"}
+    async with aiohttp.ClientSession() as session:
+        async with session.post(url, headers=headers, json=fields) as resp:
+            text = await resp.text()
+            if resp.status >= 400:
+                raise EposAPIError(f"POST {url} [{resp.status}]: {text}")
+            if not text:
+                return None
+            try:
+                return await resp.json(content_type=None)
+            except (aiohttp.ContentTypeError, ValueError):
+                return text
+
+
+def _pick_business(payload) -> dict:
+    if isinstance(payload, list):
+        return payload[0] if payload else {}
+    if isinstance(payload, dict):
+        results = payload.get("results")
+        if isinstance(results, list) and results:
+            return results[0]
+        return payload
+    return {}
+
+
+def _flatten_fk(value):
+    if isinstance(value, dict):
+        return value.get("id") or value.get("pk")
+    return value
+
+
+def _calc_blocked_date(today: date = None) -> str:
+    """
+    < 20-го числа       -> 1-е число следующего месяца
+    20-го числа и позже -> 1-е число месяца после следующего
+    """
+    today = today or date.today()
+    months_ahead = 1 if today.day < 20 else 2
+    month = today.month + months_ahead
+    year = today.year + (month - 1) // 12
+    month = ((month - 1) % 12) + 1
+    return date(year, month, 1).isoformat()
+
+
+@dp.message_handler(
+    chat_type=types.ChatType.PRIVATE,
+    content_types=types.ContentType.DOCUMENT,
+)
+async def handle_business_pdf(message: types.Message, state: FSMContext):
+    doc = message.document
+    if not (doc.file_name and doc.file_name.lower().endswith(".pdf")):
+        await message.answer("Пожалуйста, отправьте PDF-файл.")
+        return
+
+    if not await db.select_user(user_id=message.from_user.id):
+        await message.answer("Сначала пройдите регистрацию через /start.")
+        return
+
+    fd, tmp_path = tempfile.mkstemp(suffix=".pdf")
+    os.close(fd)
+    try:
+        await doc.download(destination_file=tmp_path)
+        try:
+            parsed = parse_business_pdf(tmp_path)
+        except PdfParseError as e:
+            await message.answer(f"Не удалось разобрать PDF: {e}")
+            return
+    finally:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+
+    zavod = parsed.get("zavod")
+    if not zavod or zavod == "—":
+        await message.answer("<i>virtual_number в PDF не найден.</i>")
+        return
+
+    try:
+        token = await epos_api.get_token()
+        business_data = await get_business(zavod, token)
+    except EposAPIError as e:
+        logging.exception("get_business failed")
+        await message.answer(f"⚠️ get_business: {html.escape(str(e))}")
+        return
+
+    text = format_analysis(parsed)
+
+    # "Новый клиент": PDF и анализ НЕ шлём сразу. Только если дилер пройдёт
+    # проверку, отправит auth key и апдейт в Cazad успешно применится —
+    # тогда _send_pdf_to_user_and_group вызовется из new_client_confirm.
+    if parsed.get("holati") == "Новый клиент":
+        await _maybe_start_new_client_flow(
+            message, state, parsed, business_data, zavod, doc.file_id, text
+        )
+        return
+
+    business = _pick_business(business_data)
+    business_id = business.get("id") or business.get("business_id")
+    if not business_id:
+        await message.answer(
+            f"⚠️ Бизнес с virtual_number=<code>{html.escape(str(zavod))}</code> "
+            f"не найден в базе."
+        )
+        return
+
+    diller_ids = await db.get_diller_ids_by_chat_id(message.from_user.id)
+    if not diller_ids:
+        await message.answer("⛔ Эта функция вам недоступна.")
+        return
+
+    business_diller_id = _flatten_fk(business.get("diller"))
+    if business_diller_id not in diller_ids:
+        await message.answer("⛔ Этот клиент вам не принадлежит.")
+        return
+
+    await _send_pdf_to_user_and_group(
+        message.chat.id, message.from_user, doc.file_id, text
+    )
+
+    if parsed.get("holati") == "Фискальный модуль изменён":
+        await _start_fiscal_change_flow(
+            message, state, parsed, business, business_id
+        )
+    elif parsed.get("holati") == "Адрес изменён":
+        await _start_address_change_flow(message, parsed, business, business_id)
+
+
+async def _send_pdf_to_user_and_group(
+    chat_id: int,
+    user,
+    doc_file_id: str,
+    text: str,
+    diller_name: str = None,
+) -> None:
+    """Send the PDF (by file_id) with analysis text to the originating chat,
+    and re-send to PDF_GROUP_CHAT_ID with diller name + sender info prepended."""
+    await _send_doc_with_text(chat_id, doc_file_id, text)
+    if not config.PDF_GROUP_CHAT_ID:
+        return
+    if diller_name is None:
+        diller_name = await get_user_diller_name(user.id) or "—"
+    name = html.escape(user.full_name)
+    group_text = (
+        f"<b>Diller:</b> {html.escape(str(diller_name))}\n"
+        f'От: <a href="tg://user?id={user.id}">{name}</a> '
+        f"(id: <code>{user.id}</code>)\n\n{text}"
+    )
+    try:
+        await _send_doc_with_text(
+            config.PDF_GROUP_CHAT_ID, doc_file_id, group_text
+        )
+    except Exception as e:
+        logging.exception(f"failed to notify PDF group: {e}")
+
+
+async def _maybe_start_new_client_flow(
+    message: types.Message,
+    state: FSMContext,
+    parsed: dict,
+    business_data,
+    virtual_number,
+    doc_file_id: str,
+    analysis_text: str,
+) -> None:
+    """Если business в Cazad есть, но dealer=null — запрашиваем auth_key
+    у дилера, который прислал PDF, и привязываем клиента к нему."""
+    business = _pick_business(business_data) if business_data is not None else {}
+    business_id = business.get("id") or business.get("business_id")
+    if not business_id:
+        return  # клиента ещё нет в базе — привязывать нечего
+
+    diller_ids = await db.get_diller_ids_by_chat_id(message.from_user.id)
+    if not diller_ids:
+        await message.answer("⛔ Эта функция вам недоступна.")
+        return
+
+    if business.get("auth_key"):
+        await message.answer("ℹ️ Этот клиент уже зарегистрирован.")
+        return
+
+    user_diller_id = diller_ids[0]
+    diller_row = await db.get_diller(user_diller_id)
+    diller_name = (
+        diller_row["name"] if diller_row and diller_row.get("name")
+        else f"id={user_diller_id}"
+    )
+
+    fiscal_modules = parsed.get("fiskal_modules") or []
+    new_fiscal = fiscal_modules[-1] if fiscal_modules else None
+    organization = parsed.get("organization") or "—"
+    activity_type = parsed.get("activity_type") or "—"
+
+    await state.update_data(
+        nc_business_id=business_id,
+        nc_business=business,
+        nc_virtual_number=virtual_number,
+        nc_organization=organization,
+        nc_address=parsed.get("address"),
+        nc_stir=parsed.get("stir"),
+        nc_business_type=parsed.get("business_type"),
+        nc_activity_type=activity_type,
+        nc_new_fiscal=new_fiscal,
+        nc_user_diller_id=user_diller_id,
+        nc_diller_name=diller_name,
+        nc_doc_file_id=doc_file_id,
+        nc_analysis_text=analysis_text,
+    )
+    await NewClientClaim.waiting_for_auth_key.set()
+    await message.answer(
+        f"📋 <b>Привязка нового клиента</b>\n"
+        f"<b>Virtual raqam:</b> <code>{html.escape(str(virtual_number))}</code>\n"
+        f"<b>Fiskal raqam:</b> <code>{html.escape(str(new_fiscal))}</code>\n"
+        f"<b>Diller:</b> <code>{html.escape(str(diller_name))}</code>\n"
+        f"<b>Firma nomi:</b> <code>{html.escape(str(organization))}</code>\n"
+        f"<b>Faoliyat turi:</b> <code>{html.escape(str(activity_type))}</code>\n\n"
+        f"Отправьте <b>auth key</b>:"
+    )
+
+
+@dp.message_handler(
+    chat_type=types.ChatType.PRIVATE,
+    content_types=types.ContentType.TEXT,
+    state=NewClientClaim.waiting_for_auth_key,
+)
+async def receive_new_client_auth_key(message: types.Message, state: FSMContext):
+    auth_key = message.text.strip()
+    if not auth_key:
+        await message.answer("⚠️ Пустой auth key. Попробуй ещё раз.")
+        return
+
+    await state.update_data(nc_auth_key=auth_key)
+    await NewClientClaim.confirming.set()
+
+    data = await state.get_data()
+    organization = data.get("nc_organization") or "—"
+    stir = data.get("nc_stir") or "—"
+    address = data.get("nc_address") or "—"
+    new_fiscal = data.get("nc_new_fiscal") or "—"
+    activity_type = data.get("nc_activity_type") or "—"
+    diller_name = data.get("nc_diller_name") or "—"
+    blocked_date = _calc_blocked_date()
+
+    await message.answer(
+        f"<b>Бизнес будет добавлен:</b>\n"
+        f"<b>Fiskal raqam:</b> <code>{html.escape(str(new_fiscal))}</code>\n"
+        f"<b>Auth key:</b> <code>{html.escape(auth_key)}</code>\n"
+        f"<b>Diller:</b> <code>{html.escape(str(diller_name))}</code>\n"
+        f"<b>STIR:</b> <code>{html.escape(str(stir))}</code>\n"
+        f"<b>Faoliyat turi:</b> <code>{html.escape(str(activity_type))}</code>\n"
+        f"<b>Block kuni:</b> <code>{html.escape(blocked_date)}</code>\n"
+        f"<b>Biznes nomi:</b> <code>{html.escape(str(organization))}</code>\n"
+        f"<b>Tashkilot nomi:</b> <code>{html.escape(str(organization))}</code>\n"
+        f"<b>Manzil:</b> <code>{html.escape(str(address))}</code>",
+        reply_markup=new_client_confirm_keyboard(),
+    )
+
+
+@dp.callback_query_handler(
+    new_client_cb.filter(action="resend"),
+    state=NewClientClaim.confirming,
+)
+async def new_client_resend(callback: types.CallbackQuery, state: FSMContext):
+    await state.update_data(nc_auth_key=None)
+    await NewClientClaim.waiting_for_auth_key.set()
+    await callback.message.edit_text("Отправьте <b>auth key</b> заново:")
+    await callback.answer()
+
+
+@dp.callback_query_handler(
+    new_client_cb.filter(action="confirm"),
+    state=NewClientClaim.confirming,
+)
+async def new_client_confirm(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    business_id = data.get("nc_business_id")
+    business = data.get("nc_business") or {}
+    organization = data.get("nc_organization")
+    address = data.get("nc_address")
+    stir = data.get("nc_stir")
+    auth_key = data.get("nc_auth_key")
+    user_diller_id = data.get("nc_user_diller_id")
+    new_fiscal = data.get("nc_new_fiscal")
+    business_type = data.get("nc_business_type")
+
+    if not all([business_id, new_fiscal, auth_key, user_diller_id]):
+        await callback.message.edit_text("⚠️ Состояние утеряно, отправьте PDF заново.")
+        await state.finish()
+        await callback.answer()
+        return
+
+    # update_business — перезаписываем нужные поля, остальные сохраняем
+    payload = {
+        key: _flatten_fk(business.get(key))
+        for key in UPDATABLE_FIELDS
+        if key in business
+    }
+    payload["name"] = new_fiscal
+    payload["diller"] = user_diller_id
+    payload["auth_key"] = auth_key
+    payload["TIN"] = stir
+    payload["pinfl_tin"] = stir
+    payload["blocked_date"] = _calc_blocked_date()
+    if business_type is not None:
+        payload["business_type"] = business_type
+
+    try:
+        token = await epos_api.get_token()
+        await update_business(business_id, token, **payload)
+    except EposAPIError as e:
+        await callback.message.edit_text(
+            f"⚠️ update_business: {html.escape(str(e))}"
+        )
+        await state.finish()
+        await callback.answer()
+        return
+
+    # Branch: если есть — апдейтим, если нет — создаём через POST /v1/branches/
+    branches = business.get("branches") or []
+    target = next(
+        (b for b in branches if isinstance(b, dict) and b.get("id")), None
+    )
+
+    if target:
+        branch_id = target["id"]
+        branch_payload = {
+            key: _flatten_fk(target.get(key))
+            for key in BRANCH_UPDATABLE_FIELDS
+            if key in target
+        }
+        branch_payload["name"] = organization
+        branch_payload["address"] = address
+        branch_payload["contact_person"] = "User"
+        branch_payload["contact_phone"] = "+998"
+        branch_payload["business"] = business_id
+
+        try:
+            await update_branch(branch_id, token, **branch_payload)
+        except EposAPIError as e:
+            await callback.message.edit_text(
+                f"⚠️ update_branch: {html.escape(str(e))}\n"
+                f"(business уже обновлён)"
+            )
+            await state.finish()
+            await callback.answer()
+            return
+    else:
+        try:
+            await create_branch(
+                token,
+                name=organization,
+                address=address,
+                contact_person="User",
+                contact_phone="+998",
+                business=business_id,
+                city=None,
+            )
+        except EposAPIError as e:
+            await callback.message.edit_text(
+                f"⚠️ create_branch: {html.escape(str(e))}\n"
+                f"(business уже обновлён)"
+            )
+            await state.finish()
+            await callback.answer()
+            return
+
+    await callback.message.edit_text("✅ Новый клиент добавлен.")
+
+    # Только теперь, после успешного добавления в Cazad, отправляем PDF +
+    # анализ пользователю в личку и дублируем в PDF_GROUP_CHAT_ID.
+    doc_file_id = data.get("nc_doc_file_id")
+    analysis_text = data.get("nc_analysis_text")
+    diller_name = data.get("nc_diller_name")
+    if doc_file_id and analysis_text:
+        try:
+            await _send_pdf_to_user_and_group(
+                callback.message.chat.id,
+                callback.from_user,
+                doc_file_id,
+                analysis_text,
+                diller_name=diller_name,
+            )
+        except Exception as e:
+            logging.exception(f"failed to resend PDF after new-client success: {e}")
+
+    await state.finish()
+    await callback.answer()
+
+
+async def _start_fiscal_change_flow(
+    message: types.Message,
+    state: FSMContext,
+    parsed: dict,
+    business: dict,
+    business_id,
+):
+    fiscal_modules = parsed.get("fiskal_modules") or []
+    if len(fiscal_modules) < 2:
+        return
+
+    new_fiscal = fiscal_modules[-1]
+    old_fiscal = fiscal_modules[-2]
+    api_name = business.get("name")
+
+    if api_name == new_fiscal:
+        await message.answer("ℹ️ Этот фискальный модуль уже внесён в базу.")
+        return
+
+    if api_name != old_fiscal:
+        await message.answer(
+            f"⚠️ Старый фискальный модуль не совпадает с name в базе.\n"
+            f"PDF (старый): <code>{html.escape(str(old_fiscal))}</code>\n"
+            f"База (name): <code>{html.escape(str(api_name))}</code>"
+        )
+        return
+
+    await state.update_data(
+        fiscal_business_id=business_id,
+        fiscal_business=business,
+        fiscal_old=old_fiscal,
+        fiscal_new=new_fiscal,
+    )
+    await FiscalModule.waiting_for_factory_id.set()
+    await message.answer(
+        f"📋 <b>Замена фискального модуля</b>\n"
+        f"Старый: <code>{html.escape(str(old_fiscal))}</code>\n"
+        f"Новый: <code>{html.escape(str(new_fiscal))}</code>\n\n"
+        f"Отправьте <b>auth key</b>:"
+    )
+
+
+@dp.message_handler(
+    chat_type=types.ChatType.PRIVATE,
+    content_types=types.ContentType.TEXT,
+    state=FiscalModule.waiting_for_factory_id,
+)
+async def receive_factory_id(message: types.Message, state: FSMContext):
+    factory_id = message.text.strip()
+    if not factory_id:
+        await message.answer("⚠️ Пустой factory_id. Попробуй ещё раз.")
+        return
+
+    await state.update_data(factory_id=factory_id)
+    await FiscalModule.confirming.set()
+
+    data = await state.get_data()
+    new_fiscal = data.get("fiscal_new", "")
+
+    await message.answer(
+        f"factory_id: <code>{html.escape(factory_id)}</code>\n"
+        f"Новое <b>name</b>: <code>{html.escape(str(new_fiscal))}</code>\n"
+        f"Новый <b>auth_key</b>: <code>{html.escape(factory_id)}</code>",
+        reply_markup=fiscal_confirm_keyboard(),
+    )
+
+
+@dp.callback_query_handler(
+    fiscal_cb.filter(action="resend"),
+    state=FiscalModule.confirming,
+)
+async def fiscal_resend(callback: types.CallbackQuery, state: FSMContext):
+    await state.update_data(factory_id=None)
+    await FiscalModule.waiting_for_factory_id.set()
+    await callback.message.edit_text("Отправьте <b>auth key</b> заново:")
+    await callback.answer()
+
+
+@dp.callback_query_handler(
+    fiscal_cb.filter(action="confirm"),
+    state=FiscalModule.confirming,
+)
+async def fiscal_confirm(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    business_id = data.get("fiscal_business_id")
+    business = data.get("fiscal_business") or {}
+    new_fiscal = data.get("fiscal_new", "")
+    factory_id = data.get("factory_id", "")
+
+    if not business_id or not factory_id:
+        await callback.message.edit_text("⚠️ Состояние утеряно, отправь PDF заново.")
+        await state.finish()
+        await callback.answer()
+        return
+
+    payload = {
+        key: _flatten_fk(business.get(key))
+        for key in UPDATABLE_FIELDS
+        if key in business
+    }
+    payload["name"] = new_fiscal
+    payload["auth_key"] = factory_id
+
+    try:
+        token = await epos_api.get_token()
+        await update_business(business_id, token, **payload)
+    except EposAPIError as e:
+        await callback.message.edit_text(
+            f"⚠️ update_business: {html.escape(str(e))}"
+        )
+        await state.finish()
+        await callback.answer()
+        return
+
+    await callback.message.edit_text(
+        f"✅ Business обновлён.\n"
+        f"<b>name:</b> <code>{html.escape(str(new_fiscal))}</code>\n"
+        f"<b>auth_key:</b> <code>{html.escape(factory_id)}</code>"
+    )
+    await state.finish()
+    await callback.answer()
+
+
+async def _start_address_change_flow(
+    message: types.Message,
+    parsed: dict,
+    business: dict,
+    business_id,
+):
+    new_address = parsed.get("address")
+    if not new_address or new_address == "—":
+        await message.answer("⚠️ Адрес в PDF не найден.")
+        return
+
+    branches = business.get("branches") or []
+    if not isinstance(branches, list) or not branches:
+        await message.answer("⚠️ У business нет branches для обновления.")
+        return
+
+    new_norm = new_address.strip().lower()
+    for b in branches:
+        if not isinstance(b, dict):
+            continue
+        api_addr = (b.get("address") or "").strip().lower()
+        if api_addr and api_addr == new_norm:
+            await message.answer("ℹ️ Адрес уже изменён в базе.")
+            return
+
+    target = next(
+        (b for b in branches if isinstance(b, dict) and b.get("id")), None
+    )
+    if not target:
+        await message.answer("⚠️ Не нашёл branch для обновления.")
+        return
+
+    branch_id = target["id"]
+    payload = {
+        key: _flatten_fk(target.get(key))
+        for key in BRANCH_UPDATABLE_FIELDS
+        if key in target
+    }
+    payload["address"] = new_address
+    payload["business"] = business_id
+
+    try:
+        token = await epos_api.get_token()
+        await update_branch(branch_id, token, **payload)
+    except EposAPIError as e:
+        logging.exception("update_branch failed")
+        await message.answer(f"⚠️ update_branch: {html.escape(str(e))}")
+        return
+
+    await message.answer(
+        f"✅ Адрес обновлён.\n"
+        f"<b>Новый адрес:</b> <code>{html.escape(str(new_address))}</code>"
+    )
+
+
+async def _send_doc_with_text(chat_id, document, text: str) -> None:
+    """Send document with text as caption; fall back to two messages if over limit."""
+    if len(text) <= CAPTION_LIMIT:
+        await bot.send_document(chat_id=chat_id, document=document, caption=text)
+    else:
+        await bot.send_document(chat_id=chat_id, document=document)
+        await bot.send_message(chat_id, text)
