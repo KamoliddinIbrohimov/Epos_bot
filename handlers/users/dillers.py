@@ -23,7 +23,7 @@ async def get_dillers(token: str):
     """GET /v1/diller/ — отдельная функция, токен аргументом."""
     url = f"{config.EPOS_API_URL.rstrip('/')}/v1/diller/"
     headers = {"Authorization": f"Token {token}"}
-    async with aiohttp.ClientSession() as session:
+    async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=False)) as session:
         async with session.get(url, headers=headers) as resp:
             text = await resp.text()
             if resp.status >= 400:

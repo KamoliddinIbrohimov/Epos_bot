@@ -93,7 +93,7 @@ async def get_business(virtual_number, token):
         f"/v1/all-business/?virtual_number={virtual_number}"
     )
     headers = {"Authorization": f"Token {token}"}
-    async with aiohttp.ClientSession() as session:
+    async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=False)) as session:
         async with session.get(url, headers=headers) as resp:
             text = await resp.text()
             if resp.status >= 400:
@@ -113,7 +113,7 @@ async def update_business(business_id, token, **fields):
     """
     url = f"{config.EPOS_API_URL.rstrip('/')}/v1/businesses/{business_id}/"
     headers = {"Authorization": f"Token {token}"}
-    async with aiohttp.ClientSession() as session:
+    async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=False)) as session:
         async with session.put(url, headers=headers, json=fields) as resp:
             text = await resp.text()
             if resp.status >= 400:
@@ -133,7 +133,7 @@ async def update_branch(branch_id, token, **fields):
     """
     url = f"{config.EPOS_API_URL.rstrip('/')}/v1/branches/{branch_id}/"
     headers = {"Authorization": f"Token {token}"}
-    async with aiohttp.ClientSession() as session:
+    async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=False)) as session:
         async with session.put(url, headers=headers, json=fields) as resp:
             text = await resp.text()
             if resp.status >= 400:
@@ -153,7 +153,7 @@ async def create_branch(token, **fields):
     """
     url = f"{config.EPOS_API_URL.rstrip('/')}/v1/branches/"
     headers = {"Authorization": f"Token {token}"}
-    async with aiohttp.ClientSession() as session:
+    async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=False)) as session:
         async with session.post(url, headers=headers, json=fields) as resp:
             text = await resp.text()
             if resp.status >= 400:

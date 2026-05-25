@@ -34,7 +34,9 @@ class EposAPI:
             "phone": config.EPOS_PHONE,
             "password": config.EPOS_PASSWORD,
         }
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(
+            connector=aiohttp.TCPConnector(ssl=False)
+        ) as session:
             async with session.post(self.auth_url, json=payload) as resp:
                 body = await resp.text()
                 if resp.status >= 400:
@@ -98,7 +100,9 @@ class EposAPI:
 
         for attempt in range(2):
             headers = {"authorization": f"token {token}"}
-            async with aiohttp.ClientSession() as session:
+            async with aiohttp.ClientSession(
+                connector=aiohttp.TCPConnector(ssl=False)
+            ) as session:
                 async with session.request(
                     method, url, json=json, headers=headers
                 ) as resp:

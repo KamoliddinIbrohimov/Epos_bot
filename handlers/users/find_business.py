@@ -46,7 +46,7 @@ async def get_business_by_name(name: str, token: str):
     """GET /v1/all-business/?name=... — отдельная функция, токен аргументом."""
     url = f"{config.EPOS_API_URL.rstrip('/')}/v1/all-business/?name={name}"
     headers = {"Authorization": f"Token {token}"}
-    async with aiohttp.ClientSession() as session:
+    async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=False)) as session:
         async with session.get(url, headers=headers) as resp:
             text = await resp.text()
             if resp.status >= 400:
@@ -67,7 +67,7 @@ async def update_business(business_id, token, **fields):
     """
     url = f"{config.EPOS_API_URL.rstrip('/')}/v1/businesses/{business_id}/"
     headers = {"Authorization": f"Token {token}"}
-    async with aiohttp.ClientSession() as session:
+    async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=False)) as session:
         async with session.put(url, headers=headers, json=fields) as resp:
             text = await resp.text()
             if resp.status >= 400:
