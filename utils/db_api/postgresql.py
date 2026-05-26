@@ -16,6 +16,12 @@ class Database:
             host=config.DB_HOST,
             database=config.DB_NAME,
         )
+        # Принудительно открываем реальную коннекцию, чтобы любая проблема
+        # с авторизацией / сетью падала ровно тут, а не отложенно на первом
+        # пользовательском запросе. Это даёт on_startup в app.py шанс
+        # поймать InvalidPasswordError и напечатать понятный лог.
+        async with self.pool.acquire() as conn:
+            await conn.execute("SELECT 1")
 
     async def execute(
         self,
