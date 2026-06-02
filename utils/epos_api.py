@@ -129,3 +129,49 @@ class EposAPI:
 
 
 epos_api = EposAPI()
+
+
+async def authed_http(
+    method: str,
+    url: str,
+    token: str,
+    *,
+    json: Optional[dict] = None,
+) -> Any:
+    """
+    HTTP-вызов с заголовком `Authorization: Token <token>` и автообновлением
+    токена на 401: один раз дергает `epos_api.refresh_token()` и повторяет.
+
+    Используется отдельными standalone-функциями (`get_dillers`,
+    `get_business_by_name`, `update_business`, `update_branch`,
+    `create_branch` и т.п.), которым нужен явно передаваемый токен, но
+    при этом обновление на 401 тоже нужно.
+
+    Возвращает распарсенный JSON, либо строку (если ответ не JSON), либо
+    None (пустой ответ). На любой статус >= 400 (кроме первого 401) бросает
+    EposAPIError.
+    """
+    for attempt in range(2):
+        headers = {"Authorization": f"Token {token}"}
+        async with aiohttp.ClientSession(
+            connector=aiohttp.TCPConnector(ssl=False)
+        ) as session:
+            async with session.request(
+                method, url, headers=headers, json=json
+            ) as resp:
+                text = await resp.text()
+                if resp.status == 401 and attempt == 0:
+                    token = await epos_api.refresh_token()
+                    continue
+                if resp.status >= 400:
+                    raise EposAPIError(
+                        f"{method} {url} [{resp.status}]: {text}"
+                    )
+                if not text:
+                    return None
+                try:
+                    return await resp.json(content_type=None)
+                except (aiohttp.ContentTypeError, ValueError):
+                    return text
+
+    raise EposAPIError(f"{method} {url}: auth retry exhausted")

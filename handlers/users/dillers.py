@@ -1,7 +1,6 @@
 import html
 import re
 
-import aiohttp
 from aiogram import types
 from aiogram.dispatcher import FSMContext
 from aiogram.dispatcher.filters.state import State, StatesGroup
@@ -11,7 +10,7 @@ from data.config import ADMINS
 from keyboards.default.admin import ADD_DILLER_BTN
 from keyboards.inline.dillers import diller_cb, dillers_keyboard
 from loader import db, dp
-from utils.epos_api import EposAPIError, epos_api
+from utils.epos_api import EposAPIError, authed_http, epos_api
 
 
 class AddDiller(StatesGroup):
@@ -20,20 +19,9 @@ class AddDiller(StatesGroup):
 
 
 async def get_dillers(token: str):
-    """GET /v1/diller/ — отдельная функция, токен аргументом."""
+    """GET /v1/diller/ — auto-retry on 401 via authed_http."""
     url = f"{config.EPOS_API_URL.rstrip('/')}/v1/diller/"
-    headers = {"Authorization": f"Token {token}"}
-    async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=False)) as session:
-        async with session.get(url, headers=headers) as resp:
-            text = await resp.text()
-            if resp.status >= 400:
-                raise EposAPIError(f"GET {url} [{resp.status}]: {text}")
-            if not text:
-                return None
-            try:
-                return await resp.json(content_type=None)
-            except (aiohttp.ContentTypeError, ValueError):
-                return text
+    return await authed_http("GET", url, token)
 
 
 def _pick_list(payload):

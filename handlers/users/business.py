@@ -4,7 +4,6 @@ import os
 import tempfile
 from datetime import date
 
-import aiohttp
 from aiogram import types
 from aiogram.dispatcher import FSMContext
 from aiogram.dispatcher.filters.state import State, StatesGroup
@@ -14,7 +13,7 @@ from aiogram.utils.callback_data import CallbackData
 from data import config
 from loader import bot, db, dp
 from utils.diller import get_user_diller_name
-from utils.epos_api import EposAPIError, epos_api
+from utils.epos_api import EposAPIError, authed_http, epos_api
 from utils.parse_pdf import PdfParseError, format_analysis, parse_business_pdf
 
 CAPTION_LIMIT = 1024
@@ -87,83 +86,30 @@ def new_client_confirm_keyboard() -> InlineKeyboardMarkup:
 
 
 async def get_business(virtual_number, token):
-    """GET /v1/all-business/?virtual_number=... — отдельная функция, токен аргументом."""
+    """GET /v1/all-business/?virtual_number=... — auto-retry on 401."""
     url = (
         f"{config.EPOS_API_URL.rstrip('/')}"
         f"/v1/all-business/?virtual_number={virtual_number}"
     )
-    headers = {"Authorization": f"Token {token}"}
-    async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=False)) as session:
-        async with session.get(url, headers=headers) as resp:
-            text = await resp.text()
-            if resp.status >= 400:
-                raise EposAPIError(f"GET {url} [{resp.status}]: {text}")
-            if not text:
-                return None
-            try:
-                return await resp.json(content_type=None)
-            except (aiohttp.ContentTypeError, ValueError):
-                return text
+    return await authed_http("GET", url, token)
 
 
 async def update_business(business_id, token, **fields):
-    """
-    PUT /v1/businesses/{business_id}/ — отдельная функция, токен аргументом.
-    Принимает поля бизнеса именованными аргументами, шлёт их JSON-ом.
-    """
+    """PUT /v1/businesses/{business_id}/ — auto-retry on 401."""
     url = f"{config.EPOS_API_URL.rstrip('/')}/v1/businesses/{business_id}/"
-    headers = {"Authorization": f"Token {token}"}
-    async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=False)) as session:
-        async with session.put(url, headers=headers, json=fields) as resp:
-            text = await resp.text()
-            if resp.status >= 400:
-                raise EposAPIError(f"PUT {url} [{resp.status}]: {text}")
-            if not text:
-                return None
-            try:
-                return await resp.json(content_type=None)
-            except (aiohttp.ContentTypeError, ValueError):
-                return text
+    return await authed_http("PUT", url, token, json=fields)
 
 
 async def update_branch(branch_id, token, **fields):
-    """
-    PUT /v1/branches/{branch_id}/ — отдельная функция, токен аргументом.
-    Поля бранча идут именованными аргументами.
-    """
+    """PUT /v1/branches/{branch_id}/ — auto-retry on 401."""
     url = f"{config.EPOS_API_URL.rstrip('/')}/v1/branches/{branch_id}/"
-    headers = {"Authorization": f"Token {token}"}
-    async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=False)) as session:
-        async with session.put(url, headers=headers, json=fields) as resp:
-            text = await resp.text()
-            if resp.status >= 400:
-                raise EposAPIError(f"PUT {url} [{resp.status}]: {text}")
-            if not text:
-                return None
-            try:
-                return await resp.json(content_type=None)
-            except (aiohttp.ContentTypeError, ValueError):
-                return text
+    return await authed_http("PUT", url, token, json=fields)
 
 
 async def create_branch(token, **fields):
-    """
-    POST /v1/branches/ — отдельная функция, токен аргументом.
-    Создаёт новый branch для бизнеса. Поля идут именованными аргументами.
-    """
+    """POST /v1/branches/ — auto-retry on 401."""
     url = f"{config.EPOS_API_URL.rstrip('/')}/v1/branches/"
-    headers = {"Authorization": f"Token {token}"}
-    async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=False)) as session:
-        async with session.post(url, headers=headers, json=fields) as resp:
-            text = await resp.text()
-            if resp.status >= 400:
-                raise EposAPIError(f"POST {url} [{resp.status}]: {text}")
-            if not text:
-                return None
-            try:
-                return await resp.json(content_type=None)
-            except (aiohttp.ContentTypeError, ValueError):
-                return text
+    return await authed_http("POST", url, token, json=fields)
 
 
 def _pick_business(payload) -> dict:
