@@ -241,12 +241,14 @@ async def _send_pdf_to_user_and_group(
     diller_id: int = None,
 ) -> None:
     """Send the PDF (by file_id) with analysis text to the originating chat,
-    and ALSO forward it to all 'log' groups linked to the supplied diller_id
-    (with diller name + sender info prepended)."""
+    and ALSO forward it to:
+      - every 'log' group bound to `diller_id`, and
+      - the global PDF_GROUP_CHAT_ID (if configured),
+    with diller name + sender info prepended in the caption.
+    De-duplicates: each chat receives at most one copy.
+    """
     await _send_doc_with_text(chat_id, doc_file_id, text)
 
-    if diller_id is None:
-        return
     if diller_name is None:
         diller_name = await get_user_diller_name(user.id) or "—"
 
@@ -257,13 +259,23 @@ async def _send_pdf_to_user_and_group(
         f"(id: <code>{user.id}</code>)\n\n{text}"
     )
 
-    log_chat_ids = await db.get_log_chats_for_diller(int(diller_id))
-    for log_chat_id in log_chat_ids:
+    recipients = []
+    seen = set()
+    if diller_id is not None:
+        for cid in await db.get_log_chats_for_diller(int(diller_id)):
+            if cid not in seen:
+                seen.add(cid)
+                recipients.append(cid)
+    central = config.PDF_GROUP_CHAT_ID
+    if central and central not in seen:
+        recipients.append(central)
+
+    for log_chat_id in recipients:
         try:
             await _send_doc_with_text(log_chat_id, doc_file_id, group_caption)
         except Exception as e:
             logging.exception(
-                f"failed to send PDF to log group {log_chat_id}: {e}"
+                f"failed to send PDF to log chat {log_chat_id}: {e}"
             )
 
 
