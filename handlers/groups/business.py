@@ -42,6 +42,11 @@ async def handle_group_pdf(message: types.Message):
             )
         return
 
+    # Регистрация PDF идёт ТОЛЬКО в группах типа 'registration'.
+    # Лог-группы получают уведомления о событиях, но сами PDF не обрабатывают.
+    if chat_row.get("group_type") != "registration":
+        return
+
     chat_diller_id = chat_row.get("diller_id")
     if chat_diller_id is None:
         # Group is approved but not linked yet — should not happen under current

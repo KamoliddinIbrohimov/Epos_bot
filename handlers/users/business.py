@@ -14,6 +14,7 @@ from data import config
 from loader import bot, db, dp
 from utils.diller import get_user_diller_name
 from utils.epos_api import EposAPIError, authed_http, epos_api
+from utils.notify_groups import notify_log_groups
 from utils.parse_pdf import PdfParseError, format_analysis, parse_business_pdf
 from utils.state_control import prompt_continue_or_exit, save_prompt
 
@@ -216,7 +217,11 @@ async def handle_business_pdf(message: types.Message, state: FSMContext):
         return
 
     await _send_pdf_to_user_and_group(
-        message.chat.id, message.from_user, doc.file_id, text
+        message.chat.id,
+        message.from_user,
+        doc.file_id,
+        text,
+        diller_id=business_diller_id,
     )
 
     if parsed.get("holati") == "Фискальный модуль изменён":
@@ -233,26 +238,33 @@ async def _send_pdf_to_user_and_group(
     doc_file_id: str,
     text: str,
     diller_name: str = None,
+    diller_id: int = None,
 ) -> None:
     """Send the PDF (by file_id) with analysis text to the originating chat,
-    and re-send to PDF_GROUP_CHAT_ID with diller name + sender info prepended."""
+    and ALSO forward it to all 'log' groups linked to the supplied diller_id
+    (with diller name + sender info prepended)."""
     await _send_doc_with_text(chat_id, doc_file_id, text)
-    if not config.PDF_GROUP_CHAT_ID:
+
+    if diller_id is None:
         return
     if diller_name is None:
         diller_name = await get_user_diller_name(user.id) or "—"
+
     name = html.escape(user.full_name)
-    group_text = (
+    group_caption = (
         f"<b>Diller:</b> {html.escape(str(diller_name))}\n"
         f'От: <a href="tg://user?id={user.id}">{name}</a> '
         f"(id: <code>{user.id}</code>)\n\n{text}"
     )
-    try:
-        await _send_doc_with_text(
-            config.PDF_GROUP_CHAT_ID, doc_file_id, group_text
-        )
-    except Exception as e:
-        logging.exception(f"failed to notify PDF group: {e}")
+
+    log_chat_ids = await db.get_log_chats_for_diller(int(diller_id))
+    for log_chat_id in log_chat_ids:
+        try:
+            await _send_doc_with_text(log_chat_id, doc_file_id, group_caption)
+        except Exception as e:
+            logging.exception(
+                f"failed to send PDF to log group {log_chat_id}: {e}"
+            )
 
 
 async def _maybe_start_new_client_flow(
@@ -475,7 +487,7 @@ async def new_client_confirm(callback: types.CallbackQuery, state: FSMContext):
     await callback.message.edit_text("✅ Новый клиент добавлен.")
 
     # Только теперь, после успешного добавления в Cazad, отправляем PDF +
-    # анализ пользователю в личку и дублируем в PDF_GROUP_CHAT_ID.
+    # анализ пользователю в личку и дублируем в лог-группы этого дилера.
     doc_file_id = data.get("nc_doc_file_id")
     analysis_text = data.get("nc_analysis_text")
     diller_name = data.get("nc_diller_name")
@@ -487,9 +499,24 @@ async def new_client_confirm(callback: types.CallbackQuery, state: FSMContext):
                 doc_file_id,
                 analysis_text,
                 diller_name=diller_name,
+                diller_id=user_diller_id,
             )
         except Exception as e:
             logging.exception(f"failed to resend PDF after new-client success: {e}")
+
+    # Сводка в лог-группы дилера (текстом, помимо PDF выше).
+    user = callback.from_user
+    summary = (
+        f"🆕 <b>Новый клиент добавлен</b>\n"
+        f"<b>Diller:</b> {html.escape(str(diller_name or '—'))}\n"
+        f'От: <a href="tg://user?id={user.id}">{html.escape(user.full_name)}</a> '
+        f"(id: <code>{user.id}</code>)\n\n"
+        f"<b>Fiskal raqam:</b> <code>{html.escape(str(new_fiscal))}</code>\n"
+        f"<b>STIR:</b> <code>{html.escape(str(stir))}</code>\n"
+        f"<b>Tashkilot:</b> <code>{html.escape(str(organization))}</code>\n"
+        f"<b>Manzil:</b> <code>{html.escape(str(address))}</code>"
+    )
+    await notify_log_groups(user_diller_id, summary)
 
     await state.finish()
     await callback.answer()
@@ -621,6 +648,21 @@ async def fiscal_confirm(callback: types.CallbackQuery, state: FSMContext):
         f"<b>name:</b> <code>{html.escape(str(new_fiscal))}</code>\n"
         f"<b>auth_key:</b> <code>{html.escape(factory_id)}</code>"
     )
+
+    # В лог-группы дилера, владеющего этим бизнесом.
+    business_diller_id = _flatten_fk(business.get("diller"))
+    user = callback.from_user
+    diller_name = await get_user_diller_name(user.id) or "—"
+    summary = (
+        f"🔁 <b>Заменён фискальный модуль</b>\n"
+        f"<b>Diller:</b> {html.escape(str(diller_name))}\n"
+        f'От: <a href="tg://user?id={user.id}">{html.escape(user.full_name)}</a> '
+        f"(id: <code>{user.id}</code>)\n\n"
+        f"<b>Новый name:</b> <code>{html.escape(str(new_fiscal))}</code>\n"
+        f"<b>Новый auth_key:</b> <code>{html.escape(factory_id)}</code>"
+    )
+    await notify_log_groups(business_diller_id, summary)
+
     await state.finish()
     await callback.answer()
 
@@ -678,6 +720,18 @@ async def _start_address_change_flow(
         f"✅ Адрес обновлён.\n"
         f"<b>Новый адрес:</b> <code>{html.escape(str(new_address))}</code>"
     )
+
+    business_diller_id = _flatten_fk(business.get("diller"))
+    user = message.from_user
+    diller_name = await get_user_diller_name(user.id) or "—"
+    summary = (
+        f"📍 <b>Адрес обновлён</b>\n"
+        f"<b>Diller:</b> {html.escape(str(diller_name))}\n"
+        f'От: <a href="tg://user?id={user.id}">{html.escape(user.full_name)}</a> '
+        f"(id: <code>{user.id}</code>)\n\n"
+        f"<b>Новый адрес:</b> <code>{html.escape(str(new_address))}</code>"
+    )
+    await notify_log_groups(business_diller_id, summary)
 
 
 async def _send_doc_with_text(chat_id, document, text: str) -> None:

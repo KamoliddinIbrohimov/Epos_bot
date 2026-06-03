@@ -3,6 +3,7 @@ from aiogram.utils.callback_data import CallbackData
 
 chat_approval_cb = CallbackData("chat_approval", "action", "chat_id")
 chat_diller_link_cb = CallbackData("chat_diller", "chat_id", "diller_id")
+chat_group_type_cb = CallbackData("chat_gtype", "chat_id", "gtype")
 
 
 def chat_approval_keyboard(chat_id: int) -> InlineKeyboardMarkup:
@@ -39,4 +40,24 @@ def chat_diller_link_keyboard(chat_id: int, dillers) -> InlineKeyboardMarkup:
                 ),
             )
         )
+    return kb
+
+
+def chat_group_type_keyboard(chat_id: int) -> InlineKeyboardMarkup:
+    """Inline keyboard for choosing a chat's group_type: 'registration' or 'log'."""
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(
+        InlineKeyboardButton(
+            text="📝 Регистрация (приём PDF)",
+            callback_data=chat_group_type_cb.new(
+                chat_id=str(chat_id), gtype="registration"
+            ),
+        ),
+        InlineKeyboardButton(
+            text="📊 Лог (события дилера)",
+            callback_data=chat_group_type_cb.new(
+                chat_id=str(chat_id), gtype="log"
+            ),
+        ),
+    )
     return kb

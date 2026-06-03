@@ -15,6 +15,7 @@ from keyboards.default.admin import (
 from loader import bot, db, dp
 from utils.diller import get_user_diller_name
 from utils.epos_api import EposAPIError, authed_http, epos_api
+from utils.notify_groups import notify_log_groups
 from utils.state_control import prompt_continue_or_exit, save_prompt
 
 # Тексты reply-кнопок, которые не должны трактоваться как фискальный номер.
@@ -201,23 +202,18 @@ async def pick_business_date(
         + _summary(name, tin, branch, blocked_date)
     )
 
-    if config.PDF_GROUP_CHAT_ID:
-        user = callback.from_user
-        full_name = html.escape(user.full_name)
-        diller_name = await get_user_diller_name(user.id) or "—"
-        group_text = (
-            f"🔒 <b>Обновлена дата блокировки</b>\n"
-            f"<b>Diller:</b> {html.escape(str(diller_name))}\n"
-            f'От: <a href="tg://user?id={user.id}">{full_name}</a> '
-            f"(id: <code>{user.id}</code>)\n\n"
-            + _summary(name, tin, branch, blocked_date)
-        )
-        try:
-            await bot.send_message(
-                config.PDF_GROUP_CHAT_ID, group_text, disable_web_page_preview=True
-            )
-        except Exception as e:
-            logging.exception(f"failed to notify PDF group: {e}")
+    user = callback.from_user
+    full_name = html.escape(user.full_name)
+    diller_name = await get_user_diller_name(user.id) or "—"
+    business_diller_id = _flatten_fk(business.get("diller"))
+    group_text = (
+        f"🔒 <b>Обновлена дата блокировки</b>\n"
+        f"<b>Diller:</b> {html.escape(str(diller_name))}\n"
+        f'От: <a href="tg://user?id={user.id}">{full_name}</a> '
+        f"(id: <code>{user.id}</code>)\n\n"
+        + _summary(name, tin, branch, blocked_date)
+    )
+    await notify_log_groups(business_diller_id, group_text)
 
     await state.finish()
 

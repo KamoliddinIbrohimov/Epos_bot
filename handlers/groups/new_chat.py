@@ -10,6 +10,8 @@ from keyboards.inline.chat_approval import (
     chat_approval_keyboard,
     chat_diller_link_cb,
     chat_diller_link_keyboard,
+    chat_group_type_cb,
+    chat_group_type_keyboard,
 )
 from loader import bot, db, dp
 from utils.epos_api import EposAPIError, epos_api
@@ -159,21 +161,74 @@ async def on_chat_diller_link(call: types.CallbackQuery, callback_data: dict):
 
     new_text = (
         f"{call.message.html_text.split(chr(10) + chr(10) + '<b>Статус:</b>')[0]}\n\n"
-        f"<b>Статус:</b> ✅ одобрена и привязана к "
-        f"<b>{html.escape(diller_name)}</b> ({admin_name})"
+        f"<b>Дилер:</b> <b>{html.escape(diller_name)}</b>\n"
+        f"<b>Статус:</b> ⏳ выберите тип группы ({admin_name})"
+    )
+    try:
+        await call.message.edit_text(
+            new_text,
+            reply_markup=chat_group_type_keyboard(chat_id),
+        )
+    except Exception as e:
+        logging.exception(f"failed to edit admin message: {e}")
+
+    await call.answer()
+
+
+@dp.callback_query_handler(
+    chat_group_type_cb.filter(),
+    lambda c: str(c.from_user.id) in ADMINS,
+)
+async def on_chat_group_type(call: types.CallbackQuery, callback_data: dict):
+    chat_id = int(callback_data["chat_id"])
+    gtype = callback_data["gtype"]
+    if gtype not in ("registration", "log"):
+        await call.answer("Неизвестный тип.", show_alert=True)
+        return
+
+    row = await db.set_chat_group_type(chat_id, gtype)
+    if not row:
+        await call.answer("Группа не найдена в базе.", show_alert=True)
+        return
+
+    diller_id = row.get("diller_id")
+    diller_row = await db.get_diller(diller_id) if diller_id else None
+    diller_name = (
+        diller_row["name"] if diller_row and diller_row.get("name")
+        else f"id={diller_id}"
+    )
+    admin_name = html.escape(call.from_user.full_name)
+    gtype_human = (
+        "📝 Регистрация" if gtype == "registration" else "📊 Лог"
+    )
+
+    new_text = (
+        f"{call.message.html_text.split(chr(10) + chr(10) + '<b>Дилер:</b>')[0]}\n\n"
+        f"<b>Дилер:</b> <b>{html.escape(diller_name)}</b>\n"
+        f"<b>Тип:</b> {gtype_human}\n"
+        f"<b>Статус:</b> ✅ одобрена ({admin_name})"
     )
     try:
         await call.message.edit_text(new_text, reply_markup=None)
     except Exception as e:
         logging.exception(f"failed to edit admin message: {e}")
 
-    try:
-        await bot.send_message(
-            chat_id,
+    if gtype == "registration":
+        chat_announce = (
             f"✅ Группа одобрена и привязана к дилеру "
-            f"<b>{html.escape(diller_name)}</b>. Можете отправлять PDF-файлы.",
+            f"<b>{html.escape(diller_name)}</b>.\n"
+            f"Тип: <b>📝 Регистрация</b> — можете отправлять PDF-файлы."
         )
+    else:
+        chat_announce = (
+            f"✅ Группа одобрена и привязана к дилеру "
+            f"<b>{html.escape(diller_name)}</b>.\n"
+            f"Тип: <b>📊 Лог</b> — сюда будут приходить уведомления о "
+            f"событиях по клиентам этого дилера."
+        )
+    try:
+        await bot.send_message(chat_id, chat_announce)
     except Exception as e:
         logging.exception(f"failed to notify group {chat_id}: {e}")
 
-    await call.answer("Привязано.")
+    await call.answer("Готово.")

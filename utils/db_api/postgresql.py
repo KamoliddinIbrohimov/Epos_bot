@@ -114,14 +114,19 @@ class Database:
             added_by BIGINT,
             status VARCHAR(16) NOT NULL DEFAULT 'pending',
             diller_id INTEGER,
+            group_type VARCHAR(16),
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
         """
         await self.execute(sql, execute=True)
-        # Migration for pre-existing chats tables (idempotent).
+        # Migrations for pre-existing chats tables (idempotent).
         await self.execute(
             "ALTER TABLE chats ADD COLUMN IF NOT EXISTS diller_id INTEGER",
+            execute=True,
+        )
+        await self.execute(
+            "ALTER TABLE chats ADD COLUMN IF NOT EXISTS group_type VARCHAR(16)",
             execute=True,
         )
 
@@ -151,14 +156,38 @@ class Database:
         return await self.execute(sql, chat_id, fetchrow=True)
 
     async def set_chat_diller(self, chat_id: int, diller_id: int):
-        """Link a chat to a diller and mark it approved in one go."""
+        """Link a chat to a diller. Group still needs group_type before it's
+        fully approved — status remains 'pending' until set_chat_group_type."""
         sql = """
         UPDATE chats
-        SET diller_id = $2, status = 'approved', updated_at = CURRENT_TIMESTAMP
+        SET diller_id = $2, updated_at = CURRENT_TIMESTAMP
         WHERE chat_id = $1
         RETURNING *
         """
         return await self.execute(sql, chat_id, diller_id, fetchrow=True)
+
+    async def set_chat_group_type(self, chat_id: int, group_type: str):
+        """Set group_type ('registration' | 'log') and finalize approval."""
+        sql = """
+        UPDATE chats
+        SET group_type = $2,
+            status = 'approved',
+            updated_at = CURRENT_TIMESTAMP
+        WHERE chat_id = $1
+        RETURNING *
+        """
+        return await self.execute(sql, chat_id, group_type, fetchrow=True)
+
+    async def get_log_chats_for_diller(self, diller_id: int):
+        """Return chat_id list of 'log' groups linked to the given diller."""
+        sql = """
+        SELECT chat_id FROM chats
+        WHERE diller_id = $1
+          AND group_type = 'log'
+          AND status = 'approved'
+        """
+        rows = await self.execute(sql, diller_id, fetch=True)
+        return [r["chat_id"] for r in (rows or [])]
 
     async def create_table_dillers(self):
         sql = """
