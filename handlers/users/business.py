@@ -15,6 +15,7 @@ from loader import bot, db, dp
 from utils.diller import get_user_diller_name
 from utils.epos_api import EposAPIError, authed_http, epos_api
 from utils.parse_pdf import PdfParseError, format_analysis, parse_business_pdf
+from utils.state_control import prompt_continue_or_exit, save_prompt
 
 CAPTION_LIMIT = 1024
 
@@ -307,7 +308,7 @@ async def _maybe_start_new_client_flow(
         nc_analysis_text=analysis_text,
     )
     await NewClientClaim.waiting_for_auth_key.set()
-    await message.answer(
+    prompt = (
         f"📋 <b>Привязка нового клиента</b>\n"
         f"<b>Virtual raqam:</b> <code>{html.escape(str(virtual_number))}</code>\n"
         f"<b>Fiskal raqam:</b> <code>{html.escape(str(new_fiscal))}</code>\n"
@@ -316,6 +317,8 @@ async def _maybe_start_new_client_flow(
         f"<b>Faoliyat turi:</b> <code>{html.escape(str(activity_type))}</code>\n\n"
         f"Отправьте <b>auth key</b>:"
     )
+    await save_prompt(state, prompt)
+    await message.answer(prompt)
 
 
 @dp.message_handler(
@@ -326,7 +329,9 @@ async def _maybe_start_new_client_flow(
 async def receive_new_client_auth_key(message: types.Message, state: FSMContext):
     auth_key = message.text.strip()
     if not auth_key:
-        await message.answer("⚠️ Пустой auth key. Попробуй ещё раз.")
+        await prompt_continue_or_exit(
+            message, state, hint="auth key не может быть пустым."
+        )
         return
 
     await state.update_data(nc_auth_key=auth_key)
@@ -341,7 +346,7 @@ async def receive_new_client_auth_key(message: types.Message, state: FSMContext)
     diller_name = data.get("nc_diller_name") or "—"
     blocked_date = _calc_blocked_date()
 
-    await message.answer(
+    prompt = (
         f"<b>Бизнес будет добавлен:</b>\n"
         f"<b>Fiskal raqam:</b> <code>{html.escape(str(new_fiscal))}</code>\n"
         f"<b>Auth key:</b> <code>{html.escape(auth_key)}</code>\n"
@@ -351,9 +356,10 @@ async def receive_new_client_auth_key(message: types.Message, state: FSMContext)
         f"<b>Block kuni:</b> <code>{html.escape(blocked_date)}</code>\n"
         f"<b>Biznes nomi:</b> <code>{html.escape(str(organization))}</code>\n"
         f"<b>Tashkilot nomi:</b> <code>{html.escape(str(organization))}</code>\n"
-        f"<b>Manzil:</b> <code>{html.escape(str(address))}</code>",
-        reply_markup=new_client_confirm_keyboard(),
+        f"<b>Manzil:</b> <code>{html.escape(str(address))}</code>"
     )
+    await save_prompt(state, prompt)
+    await message.answer(prompt, reply_markup=new_client_confirm_keyboard())
 
 
 @dp.callback_query_handler(
@@ -363,7 +369,9 @@ async def receive_new_client_auth_key(message: types.Message, state: FSMContext)
 async def new_client_resend(callback: types.CallbackQuery, state: FSMContext):
     await state.update_data(nc_auth_key=None)
     await NewClientClaim.waiting_for_auth_key.set()
-    await callback.message.edit_text("Отправьте <b>auth key</b> заново:")
+    prompt = "Отправьте <b>auth key</b> заново:"
+    await save_prompt(state, prompt)
+    await callback.message.edit_text(prompt)
     await callback.answer()
 
 
@@ -521,12 +529,14 @@ async def _start_fiscal_change_flow(
         fiscal_new=new_fiscal,
     )
     await FiscalModule.waiting_for_factory_id.set()
-    await message.answer(
+    prompt = (
         f"📋 <b>Замена фискального модуля</b>\n"
         f"Старый: <code>{html.escape(str(old_fiscal))}</code>\n"
         f"Новый: <code>{html.escape(str(new_fiscal))}</code>\n\n"
         f"Отправьте <b>auth key</b>:"
     )
+    await save_prompt(state, prompt)
+    await message.answer(prompt)
 
 
 @dp.message_handler(
@@ -537,7 +547,9 @@ async def _start_fiscal_change_flow(
 async def receive_factory_id(message: types.Message, state: FSMContext):
     factory_id = message.text.strip()
     if not factory_id:
-        await message.answer("⚠️ Пустой factory_id. Попробуй ещё раз.")
+        await prompt_continue_or_exit(
+            message, state, hint="auth key не может быть пустым."
+        )
         return
 
     await state.update_data(factory_id=factory_id)
@@ -546,12 +558,13 @@ async def receive_factory_id(message: types.Message, state: FSMContext):
     data = await state.get_data()
     new_fiscal = data.get("fiscal_new", "")
 
-    await message.answer(
+    prompt = (
         f"factory_id: <code>{html.escape(factory_id)}</code>\n"
         f"Новое <b>name</b>: <code>{html.escape(str(new_fiscal))}</code>\n"
-        f"Новый <b>auth_key</b>: <code>{html.escape(factory_id)}</code>",
-        reply_markup=fiscal_confirm_keyboard(),
+        f"Новый <b>auth_key</b>: <code>{html.escape(factory_id)}</code>"
     )
+    await save_prompt(state, prompt)
+    await message.answer(prompt, reply_markup=fiscal_confirm_keyboard())
 
 
 @dp.callback_query_handler(
@@ -561,7 +574,9 @@ async def receive_factory_id(message: types.Message, state: FSMContext):
 async def fiscal_resend(callback: types.CallbackQuery, state: FSMContext):
     await state.update_data(factory_id=None)
     await FiscalModule.waiting_for_factory_id.set()
-    await callback.message.edit_text("Отправьте <b>auth key</b> заново:")
+    prompt = "Отправьте <b>auth key</b> заново:"
+    await save_prompt(state, prompt)
+    await callback.message.edit_text(prompt)
     await callback.answer()
 
 
@@ -672,3 +687,48 @@ async def _send_doc_with_text(chat_id, document, text: str) -> None:
     else:
         await bot.send_document(chat_id=chat_id, document=document)
         await bot.send_message(chat_id, text)
+
+
+@dp.message_handler(
+    state=FiscalModule.waiting_for_factory_id,
+    content_types=types.ContentType.ANY,
+)
+async def fiscal_factory_id_fallback(message: types.Message, state: FSMContext):
+    # Текст обработан receive_factory_id (зарегистрирован выше).
+    if message.content_type == types.ContentType.TEXT:
+        return
+    await prompt_continue_or_exit(
+        message, state, hint="Ожидается auth key (текст)."
+    )
+
+
+@dp.message_handler(
+    state=FiscalModule.confirming,
+    content_types=types.ContentType.ANY,
+)
+async def fiscal_confirm_fallback(message: types.Message, state: FSMContext):
+    await prompt_continue_or_exit(
+        message, state, hint="Нажми ✅ Подтвердить или 🔄 Отправить заново."
+    )
+
+
+@dp.message_handler(
+    state=NewClientClaim.waiting_for_auth_key,
+    content_types=types.ContentType.ANY,
+)
+async def new_client_auth_key_fallback(message: types.Message, state: FSMContext):
+    if message.content_type == types.ContentType.TEXT:
+        return
+    await prompt_continue_or_exit(
+        message, state, hint="Ожидается auth key (текст)."
+    )
+
+
+@dp.message_handler(
+    state=NewClientClaim.confirming,
+    content_types=types.ContentType.ANY,
+)
+async def new_client_confirm_fallback(message: types.Message, state: FSMContext):
+    await prompt_continue_or_exit(
+        message, state, hint="Нажми ✅ Подтвердить или 🔄 Отправить заново."
+    )

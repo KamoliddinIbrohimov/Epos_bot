@@ -15,6 +15,7 @@ from keyboards.default.admin import (
 from loader import bot, db, dp
 from utils.diller import get_user_diller_name
 from utils.epos_api import EposAPIError, authed_http, epos_api
+from utils.state_control import prompt_continue_or_exit, save_prompt
 
 # Тексты reply-кнопок, которые не должны трактоваться как фискальный номер.
 _BUTTON_TEXTS = {ADD_VIRTUAL_NUMBERS_BTN, ADD_DILLER_BTN, ATTACH_BUSINESS_BTN}
@@ -148,6 +149,7 @@ async def find_business_by_name(message: types.Message, state: FSMContext):
         branch=branch,
     )
     await FindBusiness.waiting_for_date.set()
+    await save_prompt(state, text)
     await message.answer(
         text,
         reply_markup=await SimpleCalendar().start_calendar(),
@@ -218,3 +220,13 @@ async def pick_business_date(
             logging.exception(f"failed to notify PDF group: {e}")
 
     await state.finish()
+
+
+@dp.message_handler(
+    state=FindBusiness.waiting_for_date,
+    content_types=types.ContentType.ANY,
+)
+async def find_business_date_fallback(message: types.Message, state: FSMContext):
+    await prompt_continue_or_exit(
+        message, state, hint="Выбери дату в календаре."
+    )

@@ -14,6 +14,11 @@ from keyboards.inline.virtual_numbers import (
 )
 from loader import dp
 from utils.epos_api import EposAPIError, epos_api
+from utils.state_control import (
+    prompt_continue_or_exit,
+    save_prompt,
+    state_control_keyboard,
+)
 
 MAX_VIRTUAL_NUMBERS = 2000
 
@@ -40,11 +45,13 @@ class AddVirtualNumbers(StatesGroup):
     state="*",
 )
 async def ask_virtual_numbers_count(message: types.Message, state: FSMContext):
-    await AddVirtualNumbers.waiting_for_count.set()
-    await message.answer(
+    prompt = (
         "Сколько виртуальных номеров создать? Отправь число "
         f"(от 1 до {MAX_VIRTUAL_NUMBERS})."
     )
+    await AddVirtualNumbers.waiting_for_count.set()
+    await save_prompt(state, prompt)
+    await message.answer(prompt)
 
 
 @dp.message_handler(
@@ -58,23 +65,24 @@ async def receive_virtual_numbers_count(message: types.Message, state: FSMContex
     try:
         count = int(raw)
     except ValueError:
-        await message.answer("⚠️ Введи целое число.")
+        await prompt_continue_or_exit(message, state, hint="Нужно целое число.")
         return
     if count <= 0:
-        await message.answer("⚠️ Число должно быть больше 0.")
+        await prompt_continue_or_exit(message, state, hint="Число должно быть > 0.")
         return
     if count > MAX_VIRTUAL_NUMBERS:
-        await message.answer(
-            f"⚠️ Слишком много. Максимум {MAX_VIRTUAL_NUMBERS} за раз."
+        await prompt_continue_or_exit(
+            message,
+            state,
+            hint=f"Максимум {MAX_VIRTUAL_NUMBERS} за раз.",
         )
         return
 
     await state.update_data(vn_count=count)
     await AddVirtualNumbers.confirming.set()
-    await message.answer(
-        f"Запросить <b>{count}</b> виртуальных номеров?",
-        reply_markup=virtual_numbers_confirm_keyboard(),
-    )
+    prompt = f"Запросить <b>{count}</b> виртуальных номеров?"
+    await save_prompt(state, prompt)
+    await message.answer(prompt, reply_markup=virtual_numbers_confirm_keyboard())
 
 
 @dp.callback_query_handler(
@@ -137,6 +145,26 @@ async def add_virtual_numbers(call: types.CallbackQuery, state: FSMContext):
     await call.message.answer_document(
         types.InputFile(xls_buffer, filename=file_name),
         caption=f"Получено {len(numbers)} виртуальных номеров",
+    )
+
+
+@dp.message_handler(
+    state=AddVirtualNumbers.waiting_for_count,
+    content_types=types.ContentType.ANY,
+)
+async def vn_count_fallback(message: types.Message, state: FSMContext):
+    await prompt_continue_or_exit(
+        message, state, hint="Ожидалось целое число."
+    )
+
+
+@dp.message_handler(
+    state=AddVirtualNumbers.confirming,
+    content_types=types.ContentType.ANY,
+)
+async def vn_confirm_fallback(message: types.Message, state: FSMContext):
+    await prompt_continue_or_exit(
+        message, state, hint="Нажми кнопку ✅ или ❌."
     )
 
 

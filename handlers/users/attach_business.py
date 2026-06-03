@@ -18,6 +18,7 @@ from keyboards.default.admin import ATTACH_BUSINESS_BTN
 from keyboards.inline.dillers import attach_diller_cb, attach_dillers_keyboard
 from loader import dp
 from utils.epos_api import EposAPIError, epos_api
+from utils.state_control import prompt_continue_or_exit, save_prompt
 
 
 class AttachBusiness(StatesGroup):
@@ -51,10 +52,9 @@ async def start_attach_business(message: types.Message, state: FSMContext):
     }
     await state.update_data(attach_dillers_by_id=by_id)
     await AttachBusiness.choosing_diller.set()
-    await message.answer(
-        "Выберите дилера:",
-        reply_markup=attach_dillers_keyboard(dillers),
-    )
+    prompt = "Выберите дилера:"
+    await save_prompt(state, prompt)
+    await message.answer(prompt, reply_markup=attach_dillers_keyboard(dillers))
 
 
 @dp.callback_query_handler(
@@ -87,10 +87,12 @@ async def attach_diller_picked(
         attach_diller_name=diller_name,
     )
     await AttachBusiness.waiting_for_xlsx.set()
-    await callback.message.edit_text(
+    prompt = (
         f"Дилер: <b>{html.escape(diller_name)}</b>\n\n"
         f"Отправьте <b>.xlsx</b> файл."
     )
+    await save_prompt(state, prompt)
+    await callback.message.edit_text(prompt)
     await callback.answer()
 
 
@@ -103,7 +105,9 @@ async def attach_diller_picked(
 async def attach_receive_xlsx(message: types.Message, state: FSMContext):
     doc = message.document
     if not doc.file_name or not doc.file_name.lower().endswith(".xlsx"):
-        await message.answer("⚠️ Ожидается файл <b>.xlsx</b>.")
+        await prompt_continue_or_exit(
+            message, state, hint="Нужен именно .xlsx файл."
+        )
         return
 
     data = await state.get_data()
@@ -255,3 +259,27 @@ async def attach_receive_xlsx(message: types.Message, state: FSMContext):
         await message.answer("\n".join(lines) + "".join(detail_parts))
 
     await state.finish()
+
+
+@dp.message_handler(
+    state=AttachBusiness.choosing_diller,
+    content_types=types.ContentType.ANY,
+)
+async def attach_choose_fallback(message: types.Message, state: FSMContext):
+    await prompt_continue_or_exit(
+        message, state, hint="Выбери дилера кнопкой выше."
+    )
+
+
+@dp.message_handler(
+    state=AttachBusiness.waiting_for_xlsx,
+    content_types=types.ContentType.ANY,
+)
+async def attach_xlsx_fallback(message: types.Message, state: FSMContext):
+    # Документ обрабатывается attach_receive_xlsx, регистрируется выше.
+    # Сюда попадают любые не-документы.
+    if message.content_type == types.ContentType.DOCUMENT:
+        return
+    await prompt_continue_or_exit(
+        message, state, hint="Ожидается .xlsx файл."
+    )

@@ -11,6 +11,7 @@ from keyboards.default.admin import ADD_DILLER_BTN
 from keyboards.inline.dillers import diller_cb, dillers_keyboard
 from loader import db, dp
 from utils.epos_api import EposAPIError, authed_http, epos_api
+from utils.state_control import prompt_continue_or_exit, save_prompt
 
 
 class AddDiller(StatesGroup):
@@ -71,7 +72,9 @@ async def start_add_diller(message: types.Message, state: FSMContext):
         }
     await state.update_data(dillers_by_id=by_id)
     await AddDiller.choosing_diller.set()
-    await message.answer("Выберите дилера:", reply_markup=dillers_keyboard(dillers))
+    prompt = "Выберите дилера:"
+    await save_prompt(state, prompt)
+    await message.answer(prompt, reply_markup=dillers_keyboard(dillers))
 
 
 @dp.callback_query_handler(
@@ -106,10 +109,12 @@ async def diller_chosen(
         diller=diller,
     )
     await AddDiller.waiting_for_chat_id.set()
-    await callback.message.edit_text(
+    prompt = (
         f"Дилер: <b>{html.escape(diller_name)}</b>\n\n"
         f"Отправьте chat_id. Можно несколько — через пробел, запятую или с новой строки."
     )
+    await save_prompt(state, prompt)
+    await callback.message.edit_text(prompt)
     await callback.answer()
 
 
@@ -128,15 +133,20 @@ async def receive_chat_ids(message: types.Message, state: FSMContext):
             bad.append(t)
 
     if bad:
-        await message.answer(
-            "⚠️ Не распознано как chat_id: "
-            f"{html.escape(', '.join(bad))}\n"
-            "Отправь только числа."
+        await prompt_continue_or_exit(
+            message,
+            state,
+            hint=(
+                "Не распознано как chat_id: "
+                f"{html.escape(', '.join(bad))}. Только числа."
+            ),
         )
         return
 
     if not chat_ids:
-        await message.answer("⚠️ Не нашёл ни одного chat_id. Попробуй ещё раз.")
+        await prompt_continue_or_exit(
+            message, state, hint="Не нашёл ни одного chat_id."
+        )
         return
 
     data = await state.get_data()
@@ -164,3 +174,23 @@ async def receive_chat_ids(message: types.Message, state: FSMContext):
         f"(diller_id=<code>{diller_id}</code>):\n{lines}"
     )
     await state.finish()
+
+
+@dp.message_handler(
+    state=AddDiller.choosing_diller,
+    content_types=types.ContentType.ANY,
+)
+async def add_diller_choose_fallback(message: types.Message, state: FSMContext):
+    await prompt_continue_or_exit(
+        message, state, hint="Выбери дилера кнопкой выше."
+    )
+
+
+@dp.message_handler(
+    state=AddDiller.waiting_for_chat_id,
+    content_types=types.ContentType.ANY,
+)
+async def add_diller_chat_fallback(message: types.Message, state: FSMContext):
+    await prompt_continue_or_exit(
+        message, state, hint="Ожидаются chat_id (числа)."
+    )
