@@ -145,14 +145,16 @@ def _calc_blocked_date(today: date = None) -> str:
 
 
 @dp.message_handler(
+    lambda m: bool(
+        m.document
+        and m.document.file_name
+        and m.document.file_name.lower().endswith(".pdf")
+    ),
     chat_type=types.ChatType.PRIVATE,
     content_types=types.ContentType.DOCUMENT,
 )
 async def handle_business_pdf(message: types.Message, state: FSMContext):
     doc = message.document
-    if not (doc.file_name and doc.file_name.lower().endswith(".pdf")):
-        await message.answer("Пожалуйста, отправьте PDF-файл.")
-        return
 
     if not await db.select_user(user_id=message.from_user.id):
         await message.answer("Сначала пройдите регистрацию через /start.")
