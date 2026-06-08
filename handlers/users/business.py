@@ -176,35 +176,77 @@ async def handle_business_pdf(message: types.Message, state: FSMContext):
             pass
 
     zavod = parsed.get("zavod")
-    if not zavod or zavod == "—":
-        await message.answer("<i>virtual_number в PDF не найден.</i>")
-        return
+    holati = parsed.get("holati")
+    fiscal_modules = parsed.get("fiskal_modules") or []
 
     try:
         token = await epos_api.get_token()
-        business_data = await get_business(zavod, token)
     except EposAPIError as e:
-        logging.exception("get_business failed")
-        await message.answer(f"⚠️ get_business: {html.escape(str(e))}")
+        logging.exception("get_token failed")
+        await message.answer(f"⚠️ get_token: {html.escape(str(e))}")
         return
 
     text = format_analysis(parsed)
 
-    # "Новый клиент": PDF и анализ НЕ шлём сразу. Только если дилер пройдёт
-    # проверку, отправит auth key и апдейт в Cazad успешно применится —
-    # тогда _send_pdf_to_user_and_group вызовется из new_client_confirm.
-    if parsed.get("holati") == "Новый клиент":
+    # --- "Новый клиент": ищем по zavod (virtual_number), как раньше ---
+    if holati == "Новый клиент":
+        if not zavod or zavod == "—":
+            await message.answer("<i>virtual_number в PDF не найден.</i>")
+            return
+        try:
+            business_data = await get_business(zavod, token)
+        except EposAPIError as e:
+            logging.exception("get_business failed")
+            await message.answer(f"⚠️ get_business: {html.escape(str(e))}")
+            return
         await _maybe_start_new_client_flow(
             message, state, parsed, business_data, zavod, doc.file_id, text
         )
         return
 
-    business = _pick_business(business_data)
-    business_id = business.get("id") or business.get("business_id")
+    # --- Фискальный/Адрес: ищем по фискальному номеру ---
+    business = {}
+    business_id = None
+    lookup_chain: tuple = ()
+
+    if holati == "Фискальный модуль изменён":
+        if len(fiscal_modules) < 2:
+            await message.answer(
+                "⚠️ Недостаточно данных в PDF для смены фискального модуля."
+            )
+            return
+        lookup_chain = (fiscal_modules[-2], fiscal_modules[-1])
+    elif holati == "Адрес изменён":
+        if not fiscal_modules:
+            await message.answer("⚠️ Фискальный номер не найден в PDF.")
+            return
+        lookup_chain = (fiscal_modules[-1],)
+    else:
+        return  # неизвестный статус — игнорим
+
+    from handlers.users.find_business import get_business_by_name
+    for fn in lookup_chain:
+        if not fn:
+            continue
+        try:
+            response = await get_business_by_name(fn, token)
+        except EposAPIError:
+            logging.exception("get_business_by_name(%r) failed", fn)
+            response = None
+        picked = _pick_business(response) if response is not None else {}
+        picked_id = picked.get("id") or picked.get("business_id")
+        if picked_id:
+            business = picked
+            business_id = picked_id
+            break
+
     if not business_id:
         await message.answer(
-            f"⚠️ Бизнес с virtual_number=<code>{html.escape(str(zavod))}</code> "
-            f"не найден в базе."
+            "⚠️ Бизнес не найден в Cazad ни по одному из фискальных номеров: "
+            + ", ".join(
+                f"<code>{html.escape(str(fn))}</code>"
+                for fn in lookup_chain if fn
+            )
         )
         return
 
@@ -226,12 +268,111 @@ async def handle_business_pdf(message: types.Message, state: FSMContext):
         diller_id=business_diller_id,
     )
 
-    if parsed.get("holati") == "Фискальный модуль изменён":
+    # Side-check: branch.name и branch.address должны совпадать с
+    # organization и address из PDF. Если что-то расходится — синкаем
+    # и шлём уведомления.
+    await _sync_branch_data(
+        message,
+        business,
+        business_id,
+        parsed.get("organization"),
+        parsed.get("address"),
+        token,
+        business_diller_id,
+    )
+
+    if holati == "Фискальный модуль изменён":
         await _start_fiscal_change_flow(
             message, state, parsed, business, business_id
         )
-    elif parsed.get("holati") == "Адрес изменён":
+    elif holati == "Адрес изменён":
         await _start_address_change_flow(message, parsed, business, business_id)
+
+
+async def _sync_branch_data(
+    message: types.Message,
+    business: dict,
+    business_id,
+    parsed_organization,
+    parsed_address,
+    token: str,
+    diller_id,
+) -> None:
+    """Сравниваем branch.name + branch.address с PDF (organization, address).
+    Если хоть одно расходится — апдейтим оба расходящихся поля, шлём
+    уведомление в private чат + в per-diller лог-группы + центральный
+    PDF_GROUP_CHAT_ID. Если оба совпадают — тихо выходим."""
+    branches = business.get("branches") or []
+    target = next(
+        (b for b in branches if isinstance(b, dict) and b.get("id")), None
+    )
+    if not target:
+        return
+
+    api_branch_name = (target.get("name") or "").strip()
+    api_branch_addr = (target.get("address") or "").strip()
+    new_name = str(parsed_organization or "").strip()
+    new_addr = str(parsed_address or "").strip()
+
+    # Игнорим пустые / «—» значения из PDF — не за что синкать.
+    name_candidate = new_name and new_name != "—"
+    addr_candidate = new_addr and new_addr != "—"
+
+    name_diff = name_candidate and api_branch_name != new_name
+    addr_diff = addr_candidate and api_branch_addr.lower() != new_addr.lower()
+
+    if not name_diff and not addr_diff:
+        return
+
+    branch_id = target["id"]
+    payload = {
+        key: _flatten_fk(target.get(key))
+        for key in BRANCH_UPDATABLE_FIELDS
+        if key in target
+    }
+    if name_diff:
+        payload["name"] = new_name
+    if addr_diff:
+        payload["address"] = new_addr
+    payload["business"] = business_id
+
+    try:
+        await update_branch(branch_id, token, **payload)
+    except EposAPIError as e:
+        logging.exception("sync branch data failed")
+        await message.answer(
+            f"⚠️ Не удалось обновить филиал: {html.escape(str(e))}"
+        )
+        return
+
+    change_lines = []
+    if name_diff:
+        change_lines.append(
+            f"<b>Имя фирмы:</b> <code>{html.escape(api_branch_name or '—')}</code> "
+            f"→ <code>{html.escape(new_name)}</code>"
+        )
+    if addr_diff:
+        change_lines.append(
+            f"<b>Адрес:</b> <code>{html.escape(api_branch_addr or '—')}</code> "
+            f"→ <code>{html.escape(new_addr)}</code>"
+        )
+    body = "\n".join(change_lines)
+
+    await message.answer(f"✅ Данные филиала обновлены.\n{body}")
+
+    user = message.from_user
+    diller_name = await get_user_diller_name(user.id) or "—"
+    summary = (
+        f"🏷 <b>Данные филиала обновлены</b>\n"
+        f"<b>Diller:</b> {html.escape(str(diller_name))}\n"
+        f'От: <a href="tg://user?id={user.id}">{html.escape(user.full_name)}</a> '
+        f"(id: <code>{user.id}</code>)\n\n"
+        f"{body}"
+    )
+    try:
+        await notify_log_groups(diller_id, summary)
+    except Exception as exc:
+        logging.exception(f"sync branch data notify_log_groups failed: {exc}")
 
 
 async def _send_pdf_to_user_and_group(
@@ -292,14 +433,18 @@ async def _maybe_start_new_client_flow(
 ) -> None:
     """Если business в Cazad есть, но dealer=null — запрашиваем auth_key
     у дилера, который прислал PDF, и привязываем клиента к нему."""
-    business = _pick_business(business_data) if business_data is not None else {}
-    business_id = business.get("id") or business.get("business_id")
-    if not business_id:
-        return  # клиента ещё нет в базе — привязывать нечего
-
     diller_ids = await db.get_diller_ids_by_chat_id(message.from_user.id)
     if not diller_ids:
         await message.answer("⛔ Эта функция вам недоступна.")
+        return
+
+    business = _pick_business(business_data) if business_data is not None else {}
+    business_id = business.get("id") or business.get("business_id")
+    if not business_id:
+        await message.answer(
+            f"⚠️ Бизнес с virtual_number=<code>{html.escape(str(virtual_number))}</code> "
+            f"не найден в базе Cazad. Регистрация невозможна."
+        )
         return
 
     if business.get("auth_key"):
