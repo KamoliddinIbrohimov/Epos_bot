@@ -18,6 +18,11 @@ class ThrottlingMiddleware(BaseMiddleware):
         super(ThrottlingMiddleware, self).__init__()
 
     async def on_process_message(self, message: types.Message, data: dict):
+        # Документы пропускаем без троттлинга — массовые загрузки PDF/xlsx
+        # это нормальный трафик от дилеров, флудить ими бессмысленно.
+        if message.document:
+            return
+
         handler = current_handler.get()
         dispatcher = Dispatcher.get_current()
         if handler:
@@ -33,5 +38,5 @@ class ThrottlingMiddleware(BaseMiddleware):
             raise CancelHandler()
 
     async def message_throttled(self, message: types.Message, throttled: Throttled):
-        if throttled.exceeded_count <= 10:
+        if throttled.exceeded_count <= 20:
             await message.reply("Too many requests!")
