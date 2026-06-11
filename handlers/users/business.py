@@ -207,35 +207,54 @@ async def handle_business_pdf(message: types.Message, state: FSMContext):
             await message.answer(f"⚠️ get_business: {html.escape(str(e))}")
             return
 
-        # Если business уже зарегистрирован и принадлежит этому дилеру —
-        # синкаем branch.name + branch.address до того, как уйдём в
-        # _maybe_start_new_client_flow.
-        business_for_sync = _pick_business(business_data) if business_data else {}
-        sync_business_id = (
-            business_for_sync.get("id") or business_for_sync.get("business_id")
-        )
-        business_diller_id = _flatten_fk(business_for_sync.get("diller"))
-        logging.info(
-            "new-client sync gate: business_id=%s diller_ids=%s "
-            "business_diller_id=%s match=%s parsed_org=%r parsed_addr=%r",
-            sync_business_id, diller_ids, business_diller_id,
-            (business_diller_id in diller_ids) if diller_ids else False,
-            parsed.get("organization"), parsed.get("address"),
-        )
-        if sync_business_id and business_diller_id in diller_ids:
-            await _sync_branch_data(
-                message,
-                business_for_sync,
-                sync_business_id,
-                parsed.get("organization"),
-                parsed.get("address"),
-                token,
-                business_diller_id,
-            )
+        # Запоминаем, был ли клиент УЖЕ зарегистрирован, чтобы после
+        # _maybe_start_new_client_flow (которое скажет "уже зарегистрирован"
+        # и выйдет) сделать пост-проверку branch.name + branch.address
+        # по ФИСКАЛЬНОМУ номеру.
+        already_registered_business = _pick_business(business_data) if business_data else {}
+        already_registered = bool(already_registered_business.get("auth_key"))
+        owner_diller_id = _flatten_fk(already_registered_business.get("diller"))
 
         await _maybe_start_new_client_flow(
             message, state, parsed, business_data, zavod, doc.file_id, text
         )
+
+        # Пост-проверка: если бизнес уже был зарегистрирован за этим же
+        # дилером — после сообщения "ℹ️ уже зарегистрирован" ищем по
+        # фискальному номеру и при расхождении имени/адреса обновляем.
+        # Если всё совпадает — `_sync_branch_data` тихо выйдет без уведомлений.
+        if (
+            already_registered
+            and owner_diller_id in diller_ids
+            and fiscal_modules
+        ):
+            from handlers.users.find_business import get_business_by_name
+            current_fiscal = fiscal_modules[-1]
+            try:
+                fiscal_response = await get_business_by_name(current_fiscal, token)
+            except EposAPIError:
+                logging.exception(
+                    "post-registered fiscal lookup get_business_by_name(%r) failed",
+                    current_fiscal,
+                )
+                fiscal_response = None
+
+            fiscal_business = (
+                _pick_business(fiscal_response) if fiscal_response is not None else {}
+            )
+            fiscal_business_id = (
+                fiscal_business.get("id") or fiscal_business.get("business_id")
+            )
+            if fiscal_business_id:
+                await _sync_branch_data(
+                    message,
+                    fiscal_business,
+                    fiscal_business_id,
+                    parsed.get("organization"),
+                    parsed.get("address"),
+                    token,
+                    _flatten_fk(fiscal_business.get("diller")),
+                )
         return
 
     # === Шаг 4: Фискальный/Адрес — ищем по фискальному номеру ===
