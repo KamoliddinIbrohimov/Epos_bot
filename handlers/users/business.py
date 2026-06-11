@@ -208,19 +208,25 @@ async def handle_business_pdf(message: types.Message, state: FSMContext):
         sync_business_id = (
             business_for_sync.get("id") or business_for_sync.get("business_id")
         )
-        if sync_business_id:
-            diller_ids = await db.get_diller_ids_by_chat_id(message.from_user.id)
-            business_diller_id = _flatten_fk(business_for_sync.get("diller"))
-            if diller_ids and business_diller_id in diller_ids:
-                await _sync_branch_data(
-                    message,
-                    business_for_sync,
-                    sync_business_id,
-                    parsed.get("organization"),
-                    parsed.get("address"),
-                    token,
-                    business_diller_id,
-                )
+        diller_ids = await db.get_diller_ids_by_chat_id(message.from_user.id)
+        business_diller_id = _flatten_fk(business_for_sync.get("diller"))
+        logging.info(
+            "new-client sync gate: business_id=%s diller_ids=%s "
+            "business_diller_id=%s match=%s parsed_org=%r parsed_addr=%r",
+            sync_business_id, diller_ids, business_diller_id,
+            (business_diller_id in diller_ids) if diller_ids else False,
+            parsed.get("organization"), parsed.get("address"),
+        )
+        if sync_business_id and diller_ids and business_diller_id in diller_ids:
+            await _sync_branch_data(
+                message,
+                business_for_sync,
+                sync_business_id,
+                parsed.get("organization"),
+                parsed.get("address"),
+                token,
+                business_diller_id,
+            )
 
         await _maybe_start_new_client_flow(
             message, state, parsed, business_data, zavod, doc.file_id, text
@@ -343,6 +349,14 @@ async def _sync_branch_data(
 
     name_diff = name_candidate and api_branch_name != new_name
     addr_diff = addr_candidate and api_branch_addr.lower() != new_addr.lower()
+
+    logging.info(
+        "sync_branch_data: branch_id=%s api_name=%r new_name=%r name_diff=%s "
+        "api_addr=%r new_addr=%r addr_diff=%s",
+        target.get("id"),
+        api_branch_name, new_name, name_diff,
+        api_branch_addr, new_addr, addr_diff,
+    )
 
     if not name_diff and not addr_diff:
         return
