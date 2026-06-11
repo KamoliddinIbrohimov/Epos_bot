@@ -179,6 +179,13 @@ async def handle_business_pdf(message: types.Message, state: FSMContext):
     holati = parsed.get("holati")
     fiscal_modules = parsed.get("fiskal_modules") or []
 
+    # === Шаг 1: проверка дилера (DB-only, ДО любого API-вызова) ===
+    diller_ids = await db.get_diller_ids_by_chat_id(message.from_user.id)
+    if not diller_ids:
+        await message.answer("⛔ Эта функция вам недоступна.")
+        return
+
+    # === Шаг 2: токен ===
     try:
         token = await epos_api.get_token()
     except EposAPIError as e:
@@ -188,7 +195,7 @@ async def handle_business_pdf(message: types.Message, state: FSMContext):
 
     text = format_analysis(parsed)
 
-    # --- "Новый клиент": ищем по zavod (virtual_number), как раньше ---
+    # === Шаг 3: "Новый клиент" — ищем по zavod (virtual_number) ===
     if holati == "Новый клиент":
         if not zavod or zavod == "—":
             await message.answer("<i>virtual_number в PDF не найден.</i>")
@@ -202,13 +209,11 @@ async def handle_business_pdf(message: types.Message, state: FSMContext):
 
         # Если business уже зарегистрирован и принадлежит этому дилеру —
         # синкаем branch.name + branch.address до того, как уйдём в
-        # _maybe_start_new_client_flow (который скажет "уже зарегистрирован"
-        # и сам ничего не апдейтит).
+        # _maybe_start_new_client_flow.
         business_for_sync = _pick_business(business_data) if business_data else {}
         sync_business_id = (
             business_for_sync.get("id") or business_for_sync.get("business_id")
         )
-        diller_ids = await db.get_diller_ids_by_chat_id(message.from_user.id)
         business_diller_id = _flatten_fk(business_for_sync.get("diller"))
         logging.info(
             "new-client sync gate: business_id=%s diller_ids=%s "
@@ -217,7 +222,7 @@ async def handle_business_pdf(message: types.Message, state: FSMContext):
             (business_diller_id in diller_ids) if diller_ids else False,
             parsed.get("organization"), parsed.get("address"),
         )
-        if sync_business_id and diller_ids and business_diller_id in diller_ids:
+        if sync_business_id and business_diller_id in diller_ids:
             await _sync_branch_data(
                 message,
                 business_for_sync,
@@ -233,7 +238,7 @@ async def handle_business_pdf(message: types.Message, state: FSMContext):
         )
         return
 
-    # --- Фискальный/Адрес: ищем по фискальному номеру ---
+    # === Шаг 4: Фискальный/Адрес — ищем по фискальному номеру ===
     business = {}
     business_id = None
     lookup_chain: tuple = ()
@@ -279,11 +284,7 @@ async def handle_business_pdf(message: types.Message, state: FSMContext):
         )
         return
 
-    diller_ids = await db.get_diller_ids_by_chat_id(message.from_user.id)
-    if not diller_ids:
-        await message.answer("⛔ Эта функция вам недоступна.")
-        return
-
+    # Ownership check — diller_ids уже получены на шаге 1.
     business_diller_id = _flatten_fk(business.get("diller"))
     if business_diller_id not in diller_ids:
         await message.answer("⛔ Этот клиент вам не принадлежит.")
@@ -327,25 +328,91 @@ async def _sync_branch_data(
     token: str,
     diller_id,
 ) -> None:
-    """Сравниваем branch.name + branch.address с PDF (organization, address).
-    Если хоть одно расходится — апдейтим оба расходящихся поля, шлём
-    уведомление в private чат + в per-diller лог-группы + центральный
-    PDF_GROUP_CHAT_ID. Если оба совпадают — тихо выходим."""
+    """Логика для уже зарегистрированного клиента:
+      * Если у бизнеса вообще нет филиала — создаём новый через create_branch
+        с данными из PDF и привязываем к business_id.
+      * Если филиал есть, но branch.name или branch.address не совпадает с
+        PDF — обновляем расходящиеся поля.
+      * Если филиал есть и всё совпадает — тихо выходим.
+
+    На любое реальное действие (создание / обновление) шлём:
+      - уведомление пользователю в private chat;
+      - уведомление в лог-группы (per-diller + центральный PDF_GROUP_CHAT_ID).
+    """
+    new_name = str(parsed_organization or "").strip()
+    new_addr = str(parsed_address or "").strip()
+    name_candidate = new_name and new_name != "—"
+    addr_candidate = new_addr and new_addr != "—"
+
     branches = business.get("branches") or []
     target = next(
         (b for b in branches if isinstance(b, dict) and b.get("id")), None
     )
+
+    # === Ветка 1: филиала нет вообще — создаём. ===
     if not target:
+        if not name_candidate and not addr_candidate:
+            # Из PDF нечего записать — некорректно создавать «пустой» branch.
+            logging.info(
+                "sync_branch_data: no target branch and no data in PDF to create one"
+            )
+            return
+
+        logging.info(
+            "sync_branch_data: no branch exists, creating new "
+            "with name=%r address=%r",
+            new_name or None, new_addr or None,
+        )
+        try:
+            await create_branch(
+                token,
+                name=new_name or None,
+                address=new_addr or None,
+                contact_person="User",
+                contact_phone="+998",
+                business=business_id,
+                city=None,
+            )
+        except EposAPIError as e:
+            logging.exception("sync branch data: create_branch failed")
+            await message.answer(
+                f"⚠️ Не удалось создать филиал: {html.escape(str(e))}"
+            )
+            return
+
+        change_lines = []
+        if name_candidate:
+            change_lines.append(
+                f"<b>Имя фирмы:</b> <code>{html.escape(new_name)}</code>"
+            )
+        if addr_candidate:
+            change_lines.append(
+                f"<b>Адрес:</b> <code>{html.escape(new_addr)}</code>"
+            )
+        body = "\n".join(change_lines)
+
+        await message.answer(f"✅ Филиал создан и привязан к клиенту.\n{body}")
+
+        user = message.from_user
+        diller_name = await get_user_diller_name(user.id) or "—"
+        summary = (
+            f"🆕 <b>Филиал создан</b>\n"
+            f"<b>Diller:</b> {html.escape(str(diller_name))}\n"
+            f'От: <a href="tg://user?id={user.id}">{html.escape(user.full_name)}</a> '
+            f"(id: <code>{user.id}</code>)\n\n"
+            f"{body}"
+        )
+        try:
+            await notify_log_groups(diller_id, summary)
+        except Exception as exc:
+            logging.exception(
+                f"sync branch data: notify_log_groups (create) failed: {exc}"
+            )
         return
 
+    # === Ветка 2: филиал есть — сравниваем и при необходимости обновляем. ===
     api_branch_name = (target.get("name") or "").strip()
     api_branch_addr = (target.get("address") or "").strip()
-    new_name = str(parsed_organization or "").strip()
-    new_addr = str(parsed_address or "").strip()
-
-    # Игнорим пустые / «—» значения из PDF — не за что синкать.
-    name_candidate = new_name and new_name != "—"
-    addr_candidate = new_addr and new_addr != "—"
 
     name_diff = name_candidate and api_branch_name != new_name
     addr_diff = addr_candidate and api_branch_addr.lower() != new_addr.lower()
