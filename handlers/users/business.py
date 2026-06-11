@@ -199,6 +199,29 @@ async def handle_business_pdf(message: types.Message, state: FSMContext):
             logging.exception("get_business failed")
             await message.answer(f"⚠️ get_business: {html.escape(str(e))}")
             return
+
+        # Если business уже зарегистрирован и принадлежит этому дилеру —
+        # синкаем branch.name + branch.address до того, как уйдём в
+        # _maybe_start_new_client_flow (который скажет "уже зарегистрирован"
+        # и сам ничего не апдейтит).
+        business_for_sync = _pick_business(business_data) if business_data else {}
+        sync_business_id = (
+            business_for_sync.get("id") or business_for_sync.get("business_id")
+        )
+        if sync_business_id:
+            diller_ids = await db.get_diller_ids_by_chat_id(message.from_user.id)
+            business_diller_id = _flatten_fk(business_for_sync.get("diller"))
+            if diller_ids and business_diller_id in diller_ids:
+                await _sync_branch_data(
+                    message,
+                    business_for_sync,
+                    sync_business_id,
+                    parsed.get("organization"),
+                    parsed.get("address"),
+                    token,
+                    business_diller_id,
+                )
+
         await _maybe_start_new_client_flow(
             message, state, parsed, business_data, zavod, doc.file_id, text
         )
