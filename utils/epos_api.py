@@ -99,7 +99,10 @@ class EposAPI:
         token = await self.get_token()
 
         for attempt in range(2):
-            headers = {"authorization": f"token {token}"}
+            # DRF TokenAuthentication ожидает ровно `Token X` (с заглавной T)
+            # в значении заголовка — иначе на части эндпоинтов прилетает 401
+            # даже со свежим токеном.
+            headers = {"Authorization": f"Token {token}"}
             async with aiohttp.ClientSession(
                 connector=aiohttp.TCPConnector(ssl=False)
             ) as session:
