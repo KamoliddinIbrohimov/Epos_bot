@@ -121,9 +121,7 @@ async def add_virtual_numbers(call: types.CallbackQuery, state: FSMContext):
     numbers = []
     try:
         for i in range(count):
-            # /billing/... принимает не Token, а session+CSRF — поэтому
-            # billing_request, а не request.
-            response = await epos_api.billing_request(
+            response = await epos_api.request(
                 "POST",
                 "/billing/api/v3/business/",
                 json=NEW_BUSINESS_PAYLOAD,
