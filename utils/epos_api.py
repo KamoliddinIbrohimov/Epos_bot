@@ -2,6 +2,7 @@ import logging
 from typing import Any, Optional
 
 import aiohttp
+from yarl import URL
 
 from data import config
 from loader import db
@@ -17,6 +18,10 @@ class EposAPI:
     def __init__(self):
         self.base_url = config.EPOS_API_URL.rstrip("/")
         self.auth_url = f"{self.base_url}/auth/login/"
+        # Session-based auth (для /billing/... эндпоинтов, которые
+        # не принимают TokenAuthentication). Cookies хранятся в памяти,
+        # инвалидируются при рестарте бота.
+        self._cookie_jar: Optional[aiohttp.CookieJar] = None
 
     async def refresh_token(self) -> str:
         """
@@ -129,6 +134,98 @@ class EposAPI:
         return await self.request(
             "GET", f"/v1/all-business/?virtual_number={virtual_number}"
         )
+
+    # ---------------------------------------------------------------
+    # Session-based аутентификация для эндпоинтов /billing/api/v3/...
+    # которые работают через Django Session + X-CSRFToken, не через
+    # DRF TokenAuthentication.
+    # ---------------------------------------------------------------
+
+    async def session_login(self) -> aiohttp.CookieJar:
+        """POST /auth/login/ как делает Swagger UI: ловим выставленные
+        сервером cookies (sessionid + csrftoken) и сохраняем их в памяти.
+        Затем эти cookies используются в billing_request()."""
+        if not config.EPOS_PHONE or not config.EPOS_PASSWORD:
+            raise EposAPIError("EPOS_PHONE / EPOS_PASSWORD не заданы в .env")
+
+        payload = {
+            "phone": config.EPOS_PHONE,
+            "password": config.EPOS_PASSWORD,
+        }
+        jar = aiohttp.CookieJar(unsafe=True)
+        async with aiohttp.ClientSession(
+            cookie_jar=jar,
+            connector=aiohttp.TCPConnector(ssl=False),
+        ) as session:
+            async with session.post(self.auth_url, json=payload) as resp:
+                body = await resp.text()
+                if resp.status >= 400:
+                    raise EposAPIError(
+                        f"session login failed [{resp.status}]: {body}"
+                    )
+
+        self._cookie_jar = jar
+        logging.info("E-POS session login OK")
+        return jar
+
+    def _get_csrf(self) -> Optional[str]:
+        """Достать csrftoken из текущего cookie_jar (если он есть)."""
+        if not self._cookie_jar:
+            return None
+        try:
+            cookies = self._cookie_jar.filter_cookies(URL(self.base_url))
+        except Exception:
+            return None
+        csrf = cookies.get("csrftoken")
+        return csrf.value if csrf else None
+
+    async def billing_request(
+        self,
+        method: str,
+        path: str,
+        *,
+        json: Optional[dict] = None,
+    ) -> Any:
+        """Запрос к /billing/... через session+CSRF, как делает Swagger.
+        На 401/403 один раз re-login и повторяем."""
+        url = (
+            path
+            if path.startswith("http")
+            else f"{self.base_url}/{path.lstrip('/')}"
+        )
+
+        if not self._cookie_jar:
+            await self.session_login()
+
+        for attempt in range(2):
+            csrf = self._get_csrf()
+            headers = {"Referer": self.base_url}
+            if csrf:
+                headers["X-CSRFToken"] = csrf
+
+            async with aiohttp.ClientSession(
+                cookie_jar=self._cookie_jar,
+                connector=aiohttp.TCPConnector(ssl=False),
+            ) as session:
+                async with session.request(
+                    method, url, json=json, headers=headers
+                ) as resp:
+                    if resp.status in (401, 403) and attempt == 0:
+                        await self.session_login()
+                        continue
+                    text = await resp.text()
+                    if resp.status >= 400:
+                        raise EposAPIError(
+                            f"{method} {url} [{resp.status}]: {text}"
+                        )
+                    if not text:
+                        return None
+                    try:
+                        return await resp.json(content_type=None)
+                    except (aiohttp.ContentTypeError, ValueError):
+                        return text
+
+        raise EposAPIError(f"{method} {url}: session retry exhausted")
 
 
 epos_api = EposAPI()
