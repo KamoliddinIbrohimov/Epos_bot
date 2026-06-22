@@ -92,9 +92,14 @@ class EposAPI:
         json: Optional[dict] = None,
     ) -> Any:
         """
-        Любой авторизованный запрос. Берёт токен из БД через get_token().
-        Если API ответил 401 (токен устарел) — вызывает refresh_token(),
-        обновляет токен в БД и повторяет запрос один раз.
+        Авторизованный запрос. Берёт токен из БД через get_token().
+
+        ВНИМАНИЕ: автообновление на 401 ВРЕМЕННО ОТКЛЮЧЕНО для дебага
+        ситуации, когда /billing/... стабильно возвращает 401 и бот
+        сжигает per-user token quota на /auth/login/. Сейчас если
+        API отвечает 401, мы просто кидаем EposAPIError без попытки
+        перевыпустить токен. Refresh случается только если в БД
+        вообще нет токена (через get_token()).
         """
         url = (
             path
@@ -103,31 +108,24 @@ class EposAPI:
         )
         token = await self.get_token()
 
-        for attempt in range(2):
-            # DRF TokenAuthentication ожидает ровно `Token X` (с заглавной T)
-            # в значении заголовка — иначе на части эндпоинтов прилетает 401
-            # даже со свежим токеном.
-            headers = {"Authorization": f"Token {token}"}
-            async with aiohttp.ClientSession(
-                connector=aiohttp.TCPConnector(ssl=False)
-            ) as session:
-                async with session.request(
-                    method, url, json=json, headers=headers
-                ) as resp:
-                    if resp.status == 401 and attempt == 0:
-                        token = await self.refresh_token()
-                        continue
-                    text = await resp.text()
-                    if resp.status >= 400:
-                        raise EposAPIError(f"{method} {url} [{resp.status}]: {text}")
-                    if not text:
-                        return None
-                    try:
-                        return await resp.json(content_type=None)
-                    except (aiohttp.ContentTypeError, ValueError):
-                        return text
-
-        raise EposAPIError("Authentication retry exhausted")
+        headers = {"Authorization": f"Token {token}"}
+        async with aiohttp.ClientSession(
+            connector=aiohttp.TCPConnector(ssl=False)
+        ) as session:
+            async with session.request(
+                method, url, json=json, headers=headers
+            ) as resp:
+                text = await resp.text()
+                if resp.status >= 400:
+                    raise EposAPIError(
+                        f"{method} {url} [{resp.status}]: {text}"
+                    )
+                if not text:
+                    return None
+                try:
+                    return await resp.json(content_type=None)
+                except (aiohttp.ContentTypeError, ValueError):
+                    return text
 
     async def get_business(self, virtual_number: str) -> Any:
         """Fetch business info by virtual_number (zavod number)."""
