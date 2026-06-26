@@ -1,7 +1,7 @@
 import logging
 
 import asyncpg
-from aiogram import executor
+from aiogram import executor, types
 
 from data import config
 from loader import dp, db
@@ -46,4 +46,8 @@ async def on_startup(dispatcher):
 
 
 if __name__ == '__main__':
-    executor.start_polling(dp, on_startup=on_startup)
+    executor.start_polling(
+        dp,
+        on_startup=on_startup,
+        allowed_updates=types.AllowedUpdates.all(),
+    )
