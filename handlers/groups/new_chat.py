@@ -12,6 +12,8 @@ from keyboards.inline.chat_approval import (
     chat_diller_link_keyboard,
     chat_group_type_cb,
     chat_group_type_keyboard,
+    chat_prodleniya_cb,
+    chat_prodleniya_keyboard,
 )
 from loader import bot, db, dp
 from utils.epos_api import EposAPIError, epos_api
@@ -202,6 +204,35 @@ async def on_chat_group_type(call: types.CallbackQuery, callback_data: dict):
         "📝 Регистрация" if gtype == "registration" else "📊 Лог"
     )
 
+    # Для registration: не финализируем сообщение здесь — ждём выбора
+    # разрешения на авто-продление. Для log — сразу «✅ одобрена».
+    if gtype == "registration":
+        new_text = (
+            f"{call.message.html_text.split(chr(10) + chr(10) + '<b>Дилер:</b>')[0]}\n\n"
+            f"<b>Дилер:</b> <b>{html.escape(diller_name)}</b>\n"
+            f"<b>Тип:</b> {gtype_human}\n"
+            f"<b>Статус:</b> ⏳ разрешить авто-продление? ({admin_name})"
+        )
+        try:
+            await call.message.edit_text(
+                new_text, reply_markup=chat_prodleniya_keyboard(chat_id)
+            )
+        except Exception as e:
+            logging.exception(f"failed to edit admin message: {e}")
+
+        chat_announce = (
+            f"✅ Группа одобрена и привязана к дилеру "
+            f"<b>{html.escape(diller_name)}</b>.\n"
+            f"Тип: <b>📝 Регистрация</b> — можете отправлять PDF-файлы."
+        )
+        try:
+            await bot.send_message(chat_id, chat_announce)
+        except Exception as e:
+            logging.exception(f"failed to notify group {chat_id}: {e}")
+
+        await call.answer()
+        return
+
     new_text = (
         f"{call.message.html_text.split(chr(10) + chr(10) + '<b>Дилер:</b>')[0]}\n\n"
         f"<b>Дилер:</b> <b>{html.escape(diller_name)}</b>\n"
@@ -213,22 +244,62 @@ async def on_chat_group_type(call: types.CallbackQuery, callback_data: dict):
     except Exception as e:
         logging.exception(f"failed to edit admin message: {e}")
 
-    if gtype == "registration":
-        chat_announce = (
-            f"✅ Группа одобрена и привязана к дилеру "
-            f"<b>{html.escape(diller_name)}</b>.\n"
-            f"Тип: <b>📝 Регистрация</b> — можете отправлять PDF-файлы."
-        )
-    else:
-        chat_announce = (
-            f"✅ Группа одобрена и привязана к дилеру "
-            f"<b>{html.escape(diller_name)}</b>.\n"
-            f"Тип: <b>📊 Лог</b> — сюда будут приходить уведомления о "
-            f"событиях по клиентам этого дилера."
-        )
+    chat_announce = (
+        f"✅ Группа одобрена и привязана к дилеру "
+        f"<b>{html.escape(diller_name)}</b>.\n"
+        f"Тип: <b>📊 Лог</b> — сюда будут приходить уведомления о "
+        f"событиях по клиентам этого дилера."
+    )
     try:
         await bot.send_message(chat_id, chat_announce)
     except Exception as e:
         logging.exception(f"failed to notify group {chat_id}: {e}")
+
+    await call.answer("Готово.")
+
+
+@dp.callback_query_handler(
+    chat_prodleniya_cb.filter(),
+    lambda c: str(c.from_user.id) in ADMINS,
+)
+async def on_chat_prodleniya(call: types.CallbackQuery, callback_data: dict):
+    chat_id = int(callback_data["chat_id"])
+    action = callback_data["action"]
+    if action not in ("allow", "deny"):
+        await call.answer("Неизвестное действие.", show_alert=True)
+        return
+
+    enabled = action == "allow"
+    row = await db.set_chat_prodleniya(chat_id, enabled)
+    if not row:
+        await call.answer("Группа не найдена в базе.", show_alert=True)
+        return
+
+    admin_name = html.escape(call.from_user.full_name)
+    prod_human = "✅ разрешено" if enabled else "❌ отклонено"
+
+    # Обновляем последнюю строку статуса в сообщении админа.
+    head = call.message.html_text.split(
+        chr(10) + chr(10) + "<b>Статус:</b>"
+    )[0]
+    new_text = (
+        f"{head}\n\n"
+        f"<b>Статус:</b> ✅ одобрена ({admin_name})\n"
+        f"<b>Авто-продление:</b> {prod_human}"
+    )
+    try:
+        await call.message.edit_text(new_text, reply_markup=None)
+    except Exception as e:
+        logging.exception(f"failed to edit admin message: {e}")
+
+    if enabled:
+        chat_announce = (
+            "🔁 Авто-продление <b>разрешено</b>: можно отправлять текстовые "
+            "сообщения с фискальными номерами и датой окончания оплаты."
+        )
+        try:
+            await bot.send_message(chat_id, chat_announce)
+        except Exception as e:
+            logging.exception(f"failed to notify group {chat_id}: {e}")
 
     await call.answer("Готово.")

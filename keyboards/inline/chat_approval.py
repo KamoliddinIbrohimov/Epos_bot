@@ -4,6 +4,7 @@ from aiogram.utils.callback_data import CallbackData
 chat_approval_cb = CallbackData("chat_approval", "action", "chat_id")
 chat_diller_link_cb = CallbackData("chat_diller", "chat_id", "diller_id")
 chat_group_type_cb = CallbackData("chat_gtype", "chat_id", "gtype")
+chat_prodleniya_cb = CallbackData("chat_prod", "chat_id", "action")
 
 
 def chat_approval_keyboard(chat_id: int) -> InlineKeyboardMarkup:
@@ -57,6 +58,26 @@ def chat_group_type_keyboard(chat_id: int) -> InlineKeyboardMarkup:
             text="📊 Лог (события дилера)",
             callback_data=chat_group_type_cb.new(
                 chat_id=str(chat_id), gtype="log"
+            ),
+        ),
+    )
+    return kb
+
+
+def chat_prodleniya_keyboard(chat_id: int) -> InlineKeyboardMarkup:
+    """Allow/Deny keyboard for enabling auto-prodleniya in a registration group."""
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton(
+            text="✅ Разрешить",
+            callback_data=chat_prodleniya_cb.new(
+                chat_id=str(chat_id), action="allow"
+            ),
+        ),
+        InlineKeyboardButton(
+            text="❌ Отклонить",
+            callback_data=chat_prodleniya_cb.new(
+                chat_id=str(chat_id), action="deny"
             ),
         ),
     )

@@ -129,6 +129,11 @@ class Database:
             "ALTER TABLE chats ADD COLUMN IF NOT EXISTS group_type VARCHAR(16)",
             execute=True,
         )
+        await self.execute(
+            "ALTER TABLE chats ADD COLUMN IF NOT EXISTS "
+            "prodleniya_enabled BOOLEAN NOT NULL DEFAULT FALSE",
+            execute=True,
+        )
 
     async def upsert_pending_chat(self, chat_id: int, title: str, added_by: int):
         sql = """
@@ -177,6 +182,124 @@ class Database:
         RETURNING *
         """
         return await self.execute(sql, chat_id, group_type, fetchrow=True)
+
+    async def set_chat_prodleniya(self, chat_id: int, enabled: bool):
+        """Toggle prodleniya (renewal via plain-text messages) for a chat.
+        Only meaningful for group_type='registration' rows — other types
+        ignore the flag."""
+        sql = """
+        UPDATE chats
+        SET prodleniya_enabled = $2,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE chat_id = $1
+        RETURNING *
+        """
+        return await self.execute(sql, chat_id, enabled, fetchrow=True)
+
+    async def create_table_prodleniya_pending(self):
+        """Очередь prodleniya-запросов к management API, которые упали
+        транзиентно (5xx/timeout). Воркер раз в N минут пытается их
+        повторно применить."""
+        sql = """
+        CREATE TABLE IF NOT EXISTS prodleniya_pending (
+            id SERIAL PRIMARY KEY,
+            chat_id BIGINT NOT NULL,
+            message_id BIGINT,
+            user_id BIGINT,
+            diller_id INTEGER,
+            fiscal_id TEXT NOT NULL,
+            target_iso DATE NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            attempts INT NOT NULL DEFAULT 0,
+            last_error TEXT,
+            next_try_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        """
+        await self.execute(sql, execute=True)
+        await self.execute(
+            "CREATE INDEX IF NOT EXISTS prodleniya_pending_ready_idx "
+            "ON prodleniya_pending (status, next_try_at)",
+            execute=True,
+        )
+
+    async def enqueue_prodleniya(
+        self,
+        *,
+        chat_id: int,
+        message_id: int,
+        user_id: int,
+        diller_id: int,
+        fiscal_id: str,
+        target_iso: str,
+        error: str,
+    ):
+        sql = """
+        INSERT INTO prodleniya_pending
+            (chat_id, message_id, user_id, diller_id, fiscal_id,
+             target_iso, last_error)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        RETURNING id
+        """
+        return await self.execute(
+            sql, chat_id, message_id, user_id, diller_id,
+            fiscal_id, target_iso, error[:1000],
+            fetchval=True,
+        )
+
+    async def list_pending_prodleniya(self, limit: int = 50):
+        sql = """
+        SELECT * FROM prodleniya_pending
+        WHERE status = 'pending' AND next_try_at <= CURRENT_TIMESTAMP
+        ORDER BY next_try_at
+        LIMIT $1
+        """
+        rows = await self.execute(sql, limit, fetch=True)
+        return rows or []
+
+    async def mark_prodleniya_done(self, id_: int):
+        sql = """
+        UPDATE prodleniya_pending
+        SET status = 'done', updated_at = CURRENT_TIMESTAMP
+        WHERE id = $1
+        """
+        await self.execute(sql, id_, execute=True)
+
+    async def mark_prodleniya_giveup(self, id_: int, error: str):
+        sql = """
+        UPDATE prodleniya_pending
+        SET status = 'giveup', last_error = $2, updated_at = CURRENT_TIMESTAMP
+        WHERE id = $1
+        """
+        await self.execute(sql, id_, error[:1000], execute=True)
+
+    async def reschedule_prodleniya(
+        self, id_: int, next_try_at, error: str
+    ):
+        sql = """
+        UPDATE prodleniya_pending
+        SET attempts = attempts + 1,
+            last_error = $2,
+            next_try_at = $3,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = $1
+        """
+        await self.execute(sql, id_, error[:1000], next_try_at, execute=True)
+
+    async def list_registration_chats(self):
+        """Return approved registration chats with diller info attached.
+        Used by admin settings screen."""
+        sql = """
+        SELECT c.chat_id, c.title, c.diller_id, c.prodleniya_enabled,
+               d.name AS diller_name
+        FROM chats c
+        LEFT JOIN dillers d ON d.id = c.diller_id
+        WHERE c.status = 'approved' AND c.group_type = 'registration'
+        ORDER BY c.updated_at DESC
+        """
+        rows = await self.execute(sql, fetch=True)
+        return rows or []
 
     async def get_log_chats_for_diller(self, diller_id: int):
         """Return chat_id list of 'log' groups linked to the given diller."""

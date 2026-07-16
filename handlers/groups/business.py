@@ -2,6 +2,7 @@ import html
 import logging
 import os
 import tempfile
+from typing import List, Optional, Tuple
 
 from aiogram import types
 
@@ -22,8 +23,16 @@ from utils.diller import get_user_diller_name
 from utils.epos_api import EposAPIError, epos_api
 from utils.notify_groups import notify_log_groups
 from utils.parse_pdf import PdfParseError, format_analysis, parse_business_pdf
+from utils.parse_prodleniya import FISCAL_RE, parse_prodleniya_text
+from utils.prodleniya_service import ProdOutcome, process_fiscal
 
 CAPTION_LIMIT = 1024
+
+# Username, который пингуется в группе, если во время prodleniya что-то
+# не удалось (бизнес не найден в Cazad, API вернул ошибку и т.п.).
+# Обычный @-mention: Telegram нотифицирует пользователя, если он состоит
+# в этой группе.
+TECH_SUPPORT_USERNAME = "epos_kamoliddin"
 
 
 @dp.message_handler(
@@ -437,3 +446,213 @@ async def _send_doc_with_text(chat_id, document, text: str) -> None:
     else:
         await bot.send_document(chat_id=chat_id, document=document)
         await bot.send_message(chat_id, text)
+
+
+# ---------------------------------------------------------------
+# Prodleniya (renewal) via plain-text messages in the same
+# registration groups that accept PDFs. Format: each line has one
+# or more VG-fiscals + dates (dd.mm.yyyy). Last date + 1 day
+# becomes the new blocked_date. Anyone in the group can post;
+# the chat's linked diller is used to validate ownership of each
+# matched business.
+# ---------------------------------------------------------------
+
+
+@dp.message_handler(
+    lambda m: bool(m.text and FISCAL_RE.search(m.text)),
+    chat_type=[types.ChatType.GROUP, types.ChatType.SUPERGROUP],
+    content_types=types.ContentType.TEXT,
+)
+async def handle_group_prodleniya(message: types.Message):
+    logging.info(
+        "prodleniya: text in chat=%s user=%s len=%s preview=%r",
+        message.chat.id, message.from_user.id,
+        len(message.text or ""), (message.text or "")[:100],
+    )
+    chat_row = await db.get_chat(message.chat.id)
+    if not chat_row or chat_row["status"] != "approved":
+        return
+    if chat_row.get("group_type") != "registration":
+        return
+    if not chat_row.get("prodleniya_enabled"):
+        return
+
+    chat_diller_id = chat_row.get("diller_id")
+    if chat_diller_id is None:
+        return
+
+    entries = parse_prodleniya_text(message.text or "")
+    if not entries:
+        return
+
+    user = message.from_user
+    full_name = html.escape(user.full_name)
+    diller_name_sender = await get_user_diller_name(user.id) or "—"
+
+    enqueue_ctx = {
+        "chat_id": message.chat.id,
+        "message_id": message.message_id,
+        "user_id": user.id,
+        "diller_id": chat_diller_id,
+    }
+
+    # Buckets for the reply summary.
+    updated_both: List[Tuple[str, str]] = []
+    updated_cazad: List[Tuple[str, str]] = []
+    updated_mgmt: List[Tuple[str, str]] = []
+    no_op: List[Tuple[str, str, str]] = []   # (fiscal, current_iso, target)
+    not_found: List[str] = []
+    queued: List[Tuple[str, str]] = []
+    errors: List[Tuple[str, str]] = []
+
+    for entry in entries:
+        target_iso = entry["new_blocked_date"]
+
+        # Prodleniya spec: try each candidate fiscal in the entry. The first
+        # one that is found in at least one backend is the winner — we don't
+        # touch the rest (they're likely old/new copies of the same cashdesk).
+        winning: Optional[ProdOutcome] = None
+        outcomes: List[ProdOutcome] = []
+        for fn in entry["fiscals"]:
+            outcome = await process_fiscal(
+                fn,
+                target_iso,
+                enqueue_context=enqueue_ctx,
+            )
+            outcomes.append(outcome)
+            found_somewhere = (
+                outcome.cazad_skipped_reason not in (None, "not_found", "error")
+                or outcome.cazad_updated
+                or outcome.mgmt_skipped_reason not in (None, "not_found", "error")
+                or outcome.mgmt_updated
+            )
+            if found_somewhere:
+                winning = outcome
+                break
+
+        if winning is None:
+            # Не найден нигде. Если попутно ловили API-ошибку — сообщим.
+            first_err = next(
+                (
+                    o.cazad_error or o.mgmt_error
+                    for o in outcomes
+                    if o.cazad_error or o.mgmt_error
+                ),
+                None,
+            )
+            if first_err:
+                errors.append((", ".join(entry["fiscals"]), first_err))
+            else:
+                not_found.append(", ".join(entry["fiscals"]))
+            continue
+
+        o = winning
+        fn = o.fiscal
+
+        # Update result classification.
+        both_up = o.cazad_updated and o.mgmt_updated
+        only_cazad = o.cazad_updated and not o.mgmt_updated
+        only_mgmt = o.mgmt_updated and not o.cazad_updated
+
+        if both_up:
+            updated_both.append((fn, target_iso))
+        elif only_cazad:
+            updated_cazad.append((fn, target_iso))
+        elif only_mgmt:
+            updated_mgmt.append((fn, target_iso))
+
+        # No-op if both backends already at/beyond target (nothing changed).
+        if (
+            not (o.cazad_updated or o.mgmt_updated)
+            and (o.cazad_skipped_reason == "no_op"
+                 or o.mgmt_skipped_reason == "no_op")
+        ):
+            current = o.cazad_current_iso or o.mgmt_current_iso or "—"
+            no_op.append((fn, str(current)[:10], target_iso))
+
+        if o.mgmt_skipped_reason == "queued":
+            queued.append((fn, target_iso))
+
+        if o.cazad_error:
+            errors.append((fn, f"cazad: {o.cazad_error}"))
+        if o.mgmt_error and o.mgmt_skipped_reason != "queued":
+            errors.append((fn, f"mgmt: {o.mgmt_error}"))
+
+        # Log-groups notify — только когда block date реально изменилась
+        # хотя бы в одном бэкенде (cazad ИЛИ management). no_op не шлём.
+        if o.cazad_updated or o.mgmt_updated:
+            tin = o.business_tin or "—"
+            biz_name = o.business_name or "—"
+            summary = (
+                "🔒 <b>Обновлена дата блокировки</b>\n"
+                f"<b>Diller:</b> {html.escape(str(diller_name_sender))}\n"
+                f"<b>От:</b> {full_name} "
+                f"(id: <code>{user.id}</code>)\n\n"
+                f"<b>Фискальный номер:</b> <code>{html.escape(fn)}</code>\n"
+                f"<b>ИНН:</b> <code>{html.escape(str(tin))}</code>\n"
+                f"<b>Название бизнеса:</b> {html.escape(str(biz_name))}\n"
+                f"<b>Дата блокировки:</b> <code>{html.escape(target_iso)}</code>"
+            )
+            try:
+                await notify_log_groups(chat_diller_id, summary)
+            except Exception as exc:
+                logging.exception(
+                    f"group prodleniya notify_log_groups failed for {fn}: {exc}"
+                )
+
+    # Build reply.
+    def _fmt_list(rows, prefix_kv=False):
+        out = []
+        for row in rows[:10]:
+            if prefix_kv:
+                fn, cur, tgt = row
+                out.append(
+                    f"  • <code>{html.escape(fn)}</code>: "
+                    f"<code>{cur}</code> ≥ <code>{tgt}</code>"
+                )
+            else:
+                fn, iso = row
+                out.append(f"  • <code>{html.escape(fn)}</code> → <code>{iso}</code>")
+        if len(rows) > 10:
+            out.append(f"  …ещё {len(rows) - 10}")
+        return out
+
+    lines: List[str] = []
+    if updated_both:
+        lines.append(f"✅ Продлено (cazad + management): <b>{len(updated_both)}</b>")
+        lines.extend(_fmt_list(updated_both))
+    if updated_cazad:
+        lines.append(f"\n✅ Продлено только в cazad: <b>{len(updated_cazad)}</b>")
+        lines.extend(_fmt_list(updated_cazad))
+    if updated_mgmt:
+        lines.append(f"\n✅ Продлено только в management: <b>{len(updated_mgmt)}</b>")
+        lines.extend(_fmt_list(updated_mgmt))
+    if no_op:
+        lines.append(f"\nℹ️ Уже актуально (не откатываем): <b>{len(no_op)}</b>")
+        lines.extend(_fmt_list(no_op, prefix_kv=True))
+    if queued:
+        lines.append(
+            f"\n⏳ Отложено (management сейчас не отвечает): <b>{len(queued)}</b>"
+        )
+        lines.extend(_fmt_list(queued))
+        lines.append(
+            "  Повторим сами каждые 2 мин. По результату ответим в этом чате."
+        )
+    if not_found:
+        lines.append(f"\n⚠️ Не найдено нигде: <b>{len(not_found)}</b>")
+        for s in not_found[:10]:
+            lines.append(f"  • <code>{html.escape(s)}</code>")
+        if len(not_found) > 10:
+            lines.append(f"  …ещё {len(not_found) - 10}")
+    if errors:
+        lines.append(f"\n❌ Ошибки API: <b>{len(errors)}</b>")
+        for fn, err in errors[:5]:
+            lines.append(
+                f"  • <code>{html.escape(fn)}</code>: {html.escape(err[:120])}"
+            )
+
+    if not_found or errors or queued:
+        lines.append(f"\n👉 @{TECH_SUPPORT_USERNAME}, проверьте пожалуйста.")
+
+    if lines:
+        await message.reply("\n".join(lines))

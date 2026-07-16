@@ -20,5 +20,12 @@ EPOS_PHONE = env.str("EPOS_PHONE", "")
 EPOS_PASSWORD = env.str("EPOS_PASSWORD", "")
 EPOS_API_URL = env.str("EPOS_API_URL", "http://api.epos.uz")
 
+# E-POS Management API (второй бэкенд, https://api.management.epos.uz)
+EPOS_MGMT_API_URL = env.str("EPOS_MGMT_API_URL", "https://api.management.epos.uz")
+EPOS_MGMT_PHONE = env.str("EPOS_MGMT_PHONE", "")
+EPOS_MGMT_PASSWORD = env.str("EPOS_MGMT_PASSWORD", "")
+EPOS_MGMT_OTP = env.str("EPOS_MGMT_OTP", "")
+EPOS_MGMT_VERIFICATION_TOKEN = env.str("EPOS_MGMT_VERIFICATION_TOKEN", "")
+
 # Telegram group to receive new-PDF / new-client notifications
 PDF_GROUP_CHAT_ID = env.int("PDF_GROUP_CHAT_ID", 0)

@@ -1,13 +1,15 @@
+import asyncio
 import logging
 
 import asyncpg
 from aiogram import executor, types
 
 from data import config
-from loader import dp, db
+from loader import dp, db, bot
 import middlewares, filters, handlers
 from utils.notify_admins import on_startup_notify
 from utils.notify_errors import notify_admins_error
+from utils.prodleniya_service import retry_worker
 from utils.set_bot_commands import set_default_commands
 
 
@@ -19,9 +21,14 @@ async def on_startup(dispatcher):
         await db.create_table_chats()
         await db.create_table_dillers()
         await db.create_table_diller_chats()
+        await db.create_table_prodleniya_pending()
 
         await set_default_commands(dispatcher)
         await on_startup_notify(dispatcher)
+
+        # Фоновый воркер: перепроигрывает prodleniya-запросы, у которых
+        # management API отвалился транзиентно. Живёт до конца процесса.
+        asyncio.create_task(retry_worker(bot, interval_sec=120))
     except asyncpg.InvalidPasswordError as e:
         logging.error(
             "DB auth failed: DB_PASS из .env не совпадает с паролем, "
