@@ -14,10 +14,17 @@ fiscal module change, address change), we forward an info message to:
 We de-duplicate: if PDF_GROUP_CHAT_ID happens to also be in the
 per-diller list (or another diller's same group_type='log' chat), it
 receives exactly one copy.
+
+Bursty flows (e.g. media-group of 10+ PDFs) can hit Telegram's per-chat
+rate limit; each send is wrapped in a small `RetryAfter`-aware retry so
+notifications don't silently disappear.
 """
 
+import asyncio
 import logging
 from typing import Optional
+
+from aiogram.utils.exceptions import RetryAfter
 
 from data import config
 from loader import bot, db
@@ -56,16 +63,27 @@ async def notify_log_groups(
         per_diller = await db.get_log_chats_for_diller(int(diller_id))
 
     for chat_id in _recipient_chat_ids(per_diller):
-        try:
-            await bot.send_message(
-                chat_id,
-                text,
-                disable_web_page_preview=disable_web_page_preview,
-            )
-        except Exception as e:
-            logging.exception(
-                f"notify_log_groups: failed to send to chat {chat_id}: {e}"
-            )
+        for attempt in range(4):
+            try:
+                await bot.send_message(
+                    chat_id,
+                    text,
+                    disable_web_page_preview=disable_web_page_preview,
+                )
+                break
+            except RetryAfter as e:
+                wait = float(e.timeout) + 0.5
+                logging.warning(
+                    "notify_log_groups %s: flood control, sleeping %.1fs "
+                    "(attempt %d/4)",
+                    chat_id, wait, attempt + 1,
+                )
+                await asyncio.sleep(wait)
+            except Exception as e:
+                logging.exception(
+                    f"notify_log_groups: failed to send to chat {chat_id}: {e}"
+                )
+                break
 
 
 async def notify_log_groups_doc(
@@ -80,11 +98,22 @@ async def notify_log_groups_doc(
         per_diller = await db.get_log_chats_for_diller(int(diller_id))
 
     for chat_id in _recipient_chat_ids(per_diller):
-        try:
-            await bot.send_document(
-                chat_id=chat_id, document=doc_file_id, caption=caption
-            )
-        except Exception as e:
-            logging.exception(
-                f"notify_log_groups_doc: failed to send to chat {chat_id}: {e}"
-            )
+        for attempt in range(4):
+            try:
+                await bot.send_document(
+                    chat_id=chat_id, document=doc_file_id, caption=caption
+                )
+                break
+            except RetryAfter as e:
+                wait = float(e.timeout) + 0.5
+                logging.warning(
+                    "notify_log_groups_doc %s: flood control, sleeping %.1fs "
+                    "(attempt %d/4)",
+                    chat_id, wait, attempt + 1,
+                )
+                await asyncio.sleep(wait)
+            except Exception as e:
+                logging.exception(
+                    f"notify_log_groups_doc: failed to send to chat {chat_id}: {e}"
+                )
+                break

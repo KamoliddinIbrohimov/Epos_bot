@@ -399,3 +399,57 @@ class Database:
         sql = "SELECT diller_id FROM diller_chats WHERE chat_id = $1"
         rows = await self.execute(sql, chat_id, fetch=True)
         return [r["diller_id"] for r in (rows or [])]
+
+    async def list_local_dillers_with_counts(self):
+        """Return every diller cached locally + counts of user-attachments and
+        chats bound to it. Used by the admin '🔧 Настройки → 👥 Диллеры'
+        screen to spot stale/dead entries and delete them."""
+        sql = """
+        SELECT d.id, d.name,
+               COALESCE(dc.cnt, 0) AS users_count,
+               COALESCE(c.cnt, 0)  AS chats_count
+        FROM dillers d
+        LEFT JOIN (
+            SELECT diller_id, COUNT(*) AS cnt FROM diller_chats GROUP BY diller_id
+        ) dc ON dc.diller_id = d.id
+        LEFT JOIN (
+            SELECT diller_id, COUNT(*) AS cnt FROM chats
+             WHERE diller_id IS NOT NULL GROUP BY diller_id
+        ) c ON c.diller_id = d.id
+        ORDER BY d.id
+        """
+        rows = await self.execute(sql, fetch=True)
+        return rows or []
+
+    async def list_diller_user_mappings(self, diller_id: int):
+        """Return chat_ids (Telegram user IDs) that are currently attached
+        to this diller in `diller_chats`. Empty list if none."""
+        sql = (
+            "SELECT chat_id FROM diller_chats WHERE diller_id = $1 "
+            "ORDER BY chat_id"
+        )
+        rows = await self.execute(sql, diller_id, fetch=True)
+        return [r["chat_id"] for r in (rows or [])]
+
+    async def delete_diller_user_mapping(self, diller_id: int, chat_id: int):
+        """Remove ONE (diller_id, chat_id) row from diller_chats. Keeps the
+        diller itself alive — used when we want to detach a single user
+        without nuking the whole diller."""
+        await self.execute(
+            "DELETE FROM diller_chats WHERE diller_id = $1 AND chat_id = $2",
+            diller_id, chat_id, execute=True,
+        )
+
+    async def delete_diller_completely(self, diller_id: int):
+        """Nuke a diller from both caches: `dillers` and `diller_chats`.
+        Does NOT touch cazad. Does NOT clear `chats.diller_id` — those are
+        rebound via the '🔄 Сменить диллера' screen individually, because
+        each chat may want a different replacement."""
+        await self.execute(
+            "DELETE FROM diller_chats WHERE diller_id = $1",
+            diller_id, execute=True,
+        )
+        await self.execute(
+            "DELETE FROM dillers WHERE id = $1",
+            diller_id, execute=True,
+        )

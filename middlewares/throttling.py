@@ -1,10 +1,15 @@
-import asyncio
+import re
 
 from aiogram import types, Dispatcher
 from aiogram.dispatcher import DEFAULT_RATE_LIMIT
 from aiogram.dispatcher.handler import CancelHandler, current_handler
 from aiogram.dispatcher.middlewares import BaseMiddleware
 from aiogram.utils.exceptions import Throttled
+
+
+# Fiscal-ID pattern (same shape as utils.parse_prodleniya.FISCAL_RE).
+# Kept local to avoid pulling handlers-layer imports into a middleware.
+_FISCAL_RE = re.compile(r"\b[A-Z]{2}\d{10,}\b", re.IGNORECASE)
 
 
 class ThrottlingMiddleware(BaseMiddleware):
@@ -21,6 +26,19 @@ class ThrottlingMiddleware(BaseMiddleware):
         # Документы пропускаем без троттлинга — массовые загрузки PDF/xlsx
         # это нормальный трафик от дилеров, флудить ими бессмысленно.
         if message.document:
+            return
+
+        # Prodleniya-текст (содержит фискалы VG/LG…) — тоже нормальный
+        # bulk-трафик: юзеры реально дампят 20+ строк в тестовую группу.
+        # У самого prodleniya-хендлера уже стоит per-chat asyncio.Lock,
+        # так что API от параллелизма защищено; middleware только мешал,
+        # блокируя сообщения ответом «Too many requests!».
+        if message.text and _FISCAL_RE.search(message.text):
+            return
+
+        # Групповые чаты вообще пропускаем — там свои flow-специфичные
+        # защиты (лок в prodleniya, _flood_safe для PDF-ответов).
+        if message.chat and message.chat.type in ("group", "supergroup"):
             return
 
         handler = current_handler.get()

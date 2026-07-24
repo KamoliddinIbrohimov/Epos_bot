@@ -15,7 +15,9 @@ OTP / verificationToken не требуются для аккаунтов без
 запроса.
 """
 
+import asyncio
 import logging
+import time
 from typing import Any, Optional
 
 import aiohttp
@@ -25,6 +27,10 @@ from loader import db
 
 
 TOKEN_KEY = "epos_management_token"
+
+# Как и cazad, management-бэкенд может иметь ограничение на частоту login'ов.
+# Coalescing одновременных refresh'ей чтобы не сжигать сессии.
+_MGMT_REFRESH_COOLDOWN_SEC = 30
 
 
 class EposMgmtAPIError(Exception):
@@ -53,48 +59,77 @@ class EposManagementAPI:
         self.base_url = config.EPOS_MGMT_API_URL.rstrip("/")
         self.auth_url = f"{self.base_url}/v1/users/authorize"
 
+        # Refresh coalescing: единый lock и timestamp последнего логина.
+        # Защищает от одновременных POST /authorize в бурсте параллельных
+        # хендлеров. Lock создаётся лениво (Py3.8 привязывает asyncio.Lock
+        # к текущему loop; при импорте модуля loop ещё нет).
+        self._refresh_lock: Optional[asyncio.Lock] = None
+        self._last_refresh_at: float = 0.0
+
+    def _get_lock(self) -> asyncio.Lock:
+        if self._refresh_lock is None:
+            self._refresh_lock = asyncio.Lock()
+        return self._refresh_lock
+
     async def refresh_token(self) -> str:
-        """Логин по .env, извлекаем accessToken, сохраняем в БД."""
+        """Логин по .env, извлекаем accessToken, сохраняем в БД.
+
+        Если refresh уже был выполнен в течение последних
+        `_MGMT_REFRESH_COOLDOWN_SEC` секунд другим воркером — возвращаем
+        текущий токен из БД, не дёргая /authorize повторно.
+        """
         if not config.EPOS_MGMT_PHONE or not config.EPOS_MGMT_PASSWORD:
             raise EposMgmtAPIError(
                 "EPOS_MGMT_PHONE / EPOS_MGMT_PASSWORD не заданы в .env"
             )
 
-        payload = {
-            "phone": config.EPOS_MGMT_PHONE,
-            "password": config.EPOS_MGMT_PASSWORD,
-        }
-        # OTP и verificationToken отправляем, только если реально заданы.
-        # Пустые строки почти наверняка спровоцируют 400 у бэкенда, требующего
-        # 2FA — но если 2FA не включён, поля просто не нужны.
-        if config.EPOS_MGMT_OTP:
-            payload["otp"] = config.EPOS_MGMT_OTP
-        if config.EPOS_MGMT_VERIFICATION_TOKEN:
-            payload["verificationToken"] = config.EPOS_MGMT_VERIFICATION_TOKEN
-
-        async with aiohttp.ClientSession(
-            connector=aiohttp.TCPConnector(ssl=False)
-        ) as session:
-            async with session.post(self.auth_url, json=payload) as resp:
-                body = await resp.text()
-                if resp.status >= 400:
-                    raise EposMgmtAPIError(
-                        f"mgmt auth failed [{resp.status}]: {body}"
+        async with self._get_lock():
+            elapsed = time.monotonic() - self._last_refresh_at
+            if elapsed < _MGMT_REFRESH_COOLDOWN_SEC:
+                cached = await db.get_setting(TOKEN_KEY)
+                if cached:
+                    logging.debug(
+                        "mgmt refresh_token: skipped (last refresh %.1fs ago)",
+                        elapsed,
                     )
-                try:
-                    data = await resp.json(content_type=None)
-                except (aiohttp.ContentTypeError, ValueError):
-                    raise EposMgmtAPIError(
-                        f"mgmt auth response is not JSON: {body}"
-                    )
+                    return cached
 
-        token = self._extract_token(data)
-        if not token:
-            raise EposMgmtAPIError(f"accessToken не найден в ответе: {data}")
+            payload = {
+                "phone": config.EPOS_MGMT_PHONE,
+                "password": config.EPOS_MGMT_PASSWORD,
+            }
+            # OTP и verificationToken отправляем, только если реально заданы.
+            # Пустые строки почти наверняка спровоцируют 400 у бэкенда,
+            # требующего 2FA — но если 2FA не включён, поля просто не нужны.
+            if config.EPOS_MGMT_OTP:
+                payload["otp"] = config.EPOS_MGMT_OTP
+            if config.EPOS_MGMT_VERIFICATION_TOKEN:
+                payload["verificationToken"] = config.EPOS_MGMT_VERIFICATION_TOKEN
 
-        await db.set_setting(TOKEN_KEY, token)
-        logging.info("E-POS Management accessToken сохранён в БД")
-        return token
+            async with aiohttp.ClientSession(
+                connector=aiohttp.TCPConnector(ssl=False)
+            ) as session:
+                async with session.post(self.auth_url, json=payload) as resp:
+                    body = await resp.text()
+                    if resp.status >= 400:
+                        raise EposMgmtAPIError(
+                            f"mgmt auth failed [{resp.status}]: {body}"
+                        )
+                    try:
+                        data = await resp.json(content_type=None)
+                    except (aiohttp.ContentTypeError, ValueError):
+                        raise EposMgmtAPIError(
+                            f"mgmt auth response is not JSON: {body}"
+                        )
+
+            token = self._extract_token(data)
+            if not token:
+                raise EposMgmtAPIError(f"accessToken не найден в ответе: {data}")
+
+            await db.set_setting(TOKEN_KEY, token)
+            self._last_refresh_at = time.monotonic()
+            logging.info("E-POS Management accessToken сохранён в БД")
+            return token
 
     @staticmethod
     def _extract_token(data: Any) -> Optional[str]:
@@ -127,7 +162,16 @@ class EposManagementAPI:
         json: Optional[dict] = None,
     ) -> Any:
         """Auth'd HTTP через `Authorization: Bearer <accessToken>`.
-        На 401 один раз дёргаем refresh_token() и повторяем."""
+
+        На 401 **или 403** один раз дёргаем refresh_token() и повторяем:
+          - 401 — токен истёк / не валиден;
+          - 403 — обычно 'ролью не разрешено', но иногда бэкенд отдаёт
+                  403 вместо 401 когда токен просрочен, либо когда роль
+                  расширили, а старый токен ещё несёт устаревший набор
+                  прав (заведён до апдейта). Повторный login освежает
+                  claims — если 403 после этого сохраняется, значит это
+                  настоящий permission-deny.
+        """
         url = (
             path
             if path.startswith("http")
@@ -144,7 +188,11 @@ class EposManagementAPI:
                     method, url, json=json, headers=headers
                 ) as resp:
                     text = await resp.text()
-                    if resp.status == 401 and attempt == 0:
+                    if resp.status in (401, 403) and attempt == 0:
+                        logging.warning(
+                            "mgmt %s -> [%s], refreshing token and retrying",
+                            url, resp.status,
+                        )
                         token = await self.refresh_token()
                         continue
                     if resp.status >= 400:

@@ -1,10 +1,12 @@
+import asyncio
 import html
 import logging
 import os
 import tempfile
-from typing import List, Optional, Tuple
+from typing import Awaitable, Callable, List, Optional, Tuple
 
 from aiogram import types
+from aiogram.utils.exceptions import BotBlocked, ChatNotFound, RetryAfter
 
 from data import config
 from handlers.users.business import (
@@ -28,11 +30,75 @@ from utils.prodleniya_service import ProdOutcome, process_fiscal
 
 CAPTION_LIMIT = 1024
 
+# Per-chat lock: prodleniya messages in the same chat are processed one at
+# a time (never in parallel). Backround: users routinely dump 20+
+# messages into a group at once — without a lock, aiogram spawns 20
+# concurrent handlers that each call management-pagination + cazad,
+# blowing past rate limits and getting «too many requests» errors.
+#
+# Locks are per-chat, so different chats run in parallel — only bursts
+# within one chat serialize. Lazy allocation to avoid a startup loop
+# binding on Py3.8.
+_PROD_CHAT_LOCKS: dict = {}
+
+
+def _get_prod_chat_lock(chat_id: int) -> asyncio.Lock:
+    lock = _PROD_CHAT_LOCKS.get(chat_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _PROD_CHAT_LOCKS[chat_id] = lock
+    return lock
+
 # Username, который пингуется в группе, если во время prodleniya что-то
 # не удалось (бизнес не найден в Cazad, API вернул ошибку и т.п.).
 # Обычный @-mention: Telegram нотифицирует пользователя, если он состоит
 # в этой группе.
 TECH_SUPPORT_USERNAME = "epos_kamoliddin"
+
+
+async def _flood_safe(
+    coro_factory: Callable[[], Awaitable],
+    desc: str = "send",
+    max_retries: int = 3,
+):
+    """Execute a Telegram send-call resiliently.
+
+    Telegram's per-chat send limit (~20 msg/min in groups) causes bursty
+    media-groups (10+ PDFs at once) to hit `RetryAfter` — without a retry,
+    the failure bubbles up and can skip subsequent work (e.g. cashdesk
+    updates that run *after* the send). This helper sleeps for the
+    `retry_after` window and retries. On any other Telegram error it logs
+    and returns `None` — the caller stays alive.
+
+    ALWAYS wrap Telegram sends coming from bursty group-PDF processing with
+    this helper. Do NOT wrap DB or upstream API calls (their own error
+    paths handle failure).
+    """
+    for attempt in range(max_retries + 1):
+        try:
+            return await coro_factory()
+        except RetryAfter as e:
+            wait = float(e.timeout) + 0.5
+            logging.warning(
+                "%s: flood control, sleeping %.1fs (attempt %d/%d)",
+                desc, wait, attempt + 1, max_retries + 1,
+            )
+            await asyncio.sleep(wait)
+        except (ChatNotFound, BotBlocked) as e:
+            logging.warning("%s: %s — skipping", desc, e)
+            return None
+        except Exception as e:
+            logging.exception("%s: send failed: %s", desc, e)
+            return None
+    logging.error("%s: gave up after %d attempts", desc, max_retries + 1)
+    return None
+
+
+async def _safe_reply(message: types.Message, text: str, desc: str = "reply") -> None:
+    """`message.reply` wrapped in `_flood_safe`. Never raises. Use for every
+    reply inside the group-PDF flow so a Telegram flood/error can't skip
+    subsequent business logic."""
+    await _flood_safe(lambda: message.reply(text), desc=desc)
 
 
 @dp.message_handler(
@@ -47,8 +113,11 @@ async def handle_group_pdf(message: types.Message):
     chat_row = await db.get_chat(message.chat.id)
     if not chat_row or chat_row["status"] != "approved":
         if chat_row and chat_row["status"] == "pending":
-            await message.reply(
-                "⏳ Группа ещё не одобрена администратором. PDF не обработан."
+            await _flood_safe(
+                lambda: message.reply(
+                    "⏳ Группа ещё не одобрена администратором. PDF не обработан."
+                ),
+                desc="pending-notice reply",
             )
         return
 
@@ -59,10 +128,11 @@ async def handle_group_pdf(message: types.Message):
 
     chat_diller_id = chat_row.get("diller_id")
     if chat_diller_id is None:
-        # Group is approved but not linked yet — should not happen under current
-        # approval flow, but guard anyway.
-        await message.reply(
-            "⚠️ Группа не привязана к дилеру. PDF не обработан."
+        await _flood_safe(
+            lambda: message.reply(
+                "⚠️ Группа не привязана к дилеру. PDF не обработан."
+            ),
+            desc="unlinked-diller reply",
         )
         return
 
@@ -73,7 +143,10 @@ async def handle_group_pdf(message: types.Message):
         try:
             parsed = parse_business_pdf(tmp_path)
         except PdfParseError as e:
-            await message.reply(f"Не удалось разобрать PDF: {e}")
+            await _flood_safe(
+                lambda: message.reply(f"Не удалось разобрать PDF: {e}"),
+                desc="parse-error reply",
+            )
             return
     finally:
         try:
@@ -83,9 +156,34 @@ async def handle_group_pdf(message: types.Message):
 
     text = format_analysis(parsed)
 
-    await _send_doc_with_text(message.chat.id, doc.file_id, text)
+    # === ПЕРВЫМ делаем изменения в cazad ===
+    # Порядок важен: если Telegram send-* потом упадёт с flood control,
+    # бизнес-обновление всё равно уже применено. До рефакторинга крутилось
+    # наоборот и flood на первом send убивал handler ДО _auto_apply_changes,
+    # из-за чего половина PDF в media-group'е "не обрабатывалась".
+    await _auto_apply_changes(message, parsed, chat_diller_id)
 
-    # Notification routed to PDF group with diller name + sender info.
+    # === Ответ в исходную группу — файл + текст под ним (как раньше) ===
+    # Пользователи хотят видеть сам PDF в bot-ответе, чтобы в чате была
+    # связка «файл → анализ». Используем reply_document (реплай-нить)
+    # с caption'ом, если помещается; иначе — файл отдельным реплаем
+    # и текст следующим реплаем.
+    if len(text) <= CAPTION_LIMIT:
+        await _flood_safe(
+            lambda: message.reply_document(doc.file_id, caption=text),
+            desc=f"analysis reply-doc {doc.file_name}",
+        )
+    else:
+        await _flood_safe(
+            lambda: message.reply_document(doc.file_id),
+            desc=f"analysis reply-doc {doc.file_name}",
+        )
+        await _flood_safe(
+            lambda: message.reply(text),
+            desc=f"analysis reply-text {doc.file_name}",
+        )
+
+    # === Форвард в центральный PDF-group ===
     if config.PDF_GROUP_CHAT_ID:
         user = message.from_user
         chat = message.chat
@@ -99,15 +197,12 @@ async def handle_group_pdf(message: types.Message):
             f'От: <a href="tg://user?id={user.id}">{name}</a> '
             f"(id: <code>{user.id}</code>)\n\n{text}"
         )
-        try:
-            await _send_doc_with_text(
+        await _flood_safe(
+            lambda: _send_doc_with_text(
                 config.PDF_GROUP_CHAT_ID, doc.file_id, group_text
-            )
-        except Exception as e:
-            logging.exception(f"failed to notify PDF group: {e}")
-
-    # Auto-apply business changes based on parsed status.
-    await _auto_apply_changes(message, parsed, chat_diller_id)
+            ),
+            desc=f"central PDF-group forward {doc.file_name}",
+        )
 
 
 async def _auto_apply_changes(
@@ -130,7 +225,7 @@ async def _auto_apply_changes(
         token = await epos_api.get_token()
     except EposAPIError as e:
         logging.exception("get_token failed in group flow")
-        await message.reply(f"⚠️ get_token: {html.escape(str(e))}")
+        await _safe_reply(message, f"⚠️ get_token: {html.escape(str(e))}", "get_token error")
         return
 
     # --- Новый клиент: по zavod, как раньше ---
@@ -142,7 +237,7 @@ async def _auto_apply_changes(
             business_data = await get_business(zavod, token)
         except EposAPIError as e:
             logging.exception("get_business failed in group flow")
-            await message.reply(f"⚠️ get_business: {html.escape(str(e))}")
+            await _safe_reply(message, f"⚠️ get_business: {html.escape(str(e))}", "get_business error")
             return
         business = _pick_business(business_data) if business_data is not None else {}
         business_id = business.get("id") or business.get("business_id")
@@ -185,18 +280,20 @@ async def _auto_apply_changes(
             break
 
     if not business_id:
-        await message.reply(
-            f"⚠️ Бизнес не найден в Cazad ни по одному из фискальных номеров: "
+        await _safe_reply(
+            message,
+            "⚠️ Бизнес не найден в Cazad ни по одному из фискальных номеров: "
             + ", ".join(
                 f"<code>{html.escape(str(fn))}</code>" for fn in lookup_chain if fn
-            )
+            ),
+            "business-not-found by fiscal chain",
         )
         return
 
     # Ownership check.
     business_diller = _flatten_fk(business.get("diller"))
     if business_diller != chat_diller_id:
-        await message.reply("⛔ Этот клиент не принадлежит вашему дилеру.")
+        await _safe_reply(message, "⛔ Этот клиент не принадлежит вашему дилеру.", "not-own client")
         return
 
     if holati == "Фискальный модуль изменён":
@@ -215,14 +312,16 @@ async def _auto_new_client(
 ) -> None:
     if not business_id:
         zavod = parsed.get("zavod") or "—"
-        await message.reply(
+        await _safe_reply(
+            message,
             f"⚠️ Бизнес с virtual_number=<code>{html.escape(str(zavod))}</code> "
-            f"не найден в базе Cazad. Регистрация невозможна."
+            f"не найден в базе Cazad. Регистрация невозможна.",
+            "business-not-found by zavod",
         )
         return
 
     if business.get("auth_key"):
-        await message.reply("ℹ️ Этот клиент уже зарегистрирован.")
+        await _safe_reply(message, "ℹ️ Этот клиент уже зарегистрирован.", "already registered")
         return
 
     fiscal_modules = parsed.get("fiskal_modules") or []
@@ -253,7 +352,7 @@ async def _auto_new_client(
         await update_business(business_id, token, **payload)
     except EposAPIError as e:
         logging.exception("update_business failed in group new-client flow")
-        await message.reply(f"⚠️ update_business: {html.escape(str(e))}")
+        await _safe_reply(message, f"⚠️ update_business: {html.escape(str(e))}", "update_business error")
         return
 
     branches = business.get("branches") or []
@@ -286,12 +385,14 @@ async def _auto_new_client(
             )
     except EposAPIError as e:
         logging.exception("branch update/create failed in group new-client flow")
-        await message.reply(
-            f"⚠️ branch: {html.escape(str(e))} (business уже обновлён)"
+        await _safe_reply(
+            message,
+            f"⚠️ branch: {html.escape(str(e))} (business уже обновлён)",
+            "branch update/create error",
         )
         return
 
-    await message.reply("✅ Новый клиент добавлен.")
+    await _safe_reply(message, "✅ Новый клиент добавлен.", "new-client OK")
 
 
 async def _auto_fiscal_change(
@@ -321,18 +422,22 @@ async def _auto_fiscal_change(
     api_name = business.get("name")
 
     if api_name == new_fiscal:
-        await message.reply(
+        await _safe_reply(
+            message,
             f"ℹ️ Фискальный модуль уже изменён в базе.\n"
-            f"<b>Текущий id:</b> <code>{html.escape(str(api_name))}</code>"
+            f"<b>Текущий id:</b> <code>{html.escape(str(api_name))}</code>",
+            "fiscal already changed",
         )
         return
 
     if api_name != old_fiscal:
-        await message.reply(
+        await _safe_reply(
+            message,
             f"⚠️ Текущий фискальный модуль в базе не совпадает с PDF.\n"
             f"<b>В базе:</b> <code>{html.escape(str(api_name))}</code>\n"
             f"<b>В PDF (старый):</b> <code>{html.escape(str(old_fiscal))}</code>\n"
-            f"<b>В PDF (новый):</b> <code>{html.escape(str(new_fiscal))}</code>"
+            f"<b>В PDF (новый):</b> <code>{html.escape(str(new_fiscal))}</code>",
+            "fiscal mismatch with PDF",
         )
         return
 
@@ -349,13 +454,15 @@ async def _auto_fiscal_change(
         await update_business(business_id, token, **payload)
     except EposAPIError as e:
         logging.exception("update_business failed in group fiscal flow")
-        await message.reply(f"⚠️ update_business: {html.escape(str(e))}")
+        await _safe_reply(message, f"⚠️ update_business: {html.escape(str(e))}", "update_business error")
         return
 
-    await message.reply(
+    await _safe_reply(
+        message,
         f"✅ Фискальный модуль обновлён.\n"
         f"<b>Было:</b> <code>{html.escape(str(old_fiscal))}</code>\n"
-        f"<b>Стало:</b> <code>{html.escape(str(new_fiscal))}</code>"
+        f"<b>Стало:</b> <code>{html.escape(str(new_fiscal))}</code>",
+        "fiscal updated",
     )
 
     business_diller_id = _flatten_fk(business.get("diller"))
@@ -393,12 +500,12 @@ async def _auto_address_change(
         (b for b in branches if isinstance(b, dict) and b.get("id")), None
     )
     if not target:
-        await message.reply("⚠️ У клиента нет филиалов для обновления.")
+        await _safe_reply(message, "⚠️ У клиента нет филиалов для обновления.", "no branches")
         return
 
     api_address = (target.get("address") or "").strip()
     if api_address.lower() == new_address.lower():
-        await message.reply("ℹ️ Адрес уже актуален.")
+        await _safe_reply(message, "ℹ️ Адрес уже актуален.", "address already actual")
         return
 
     branch_id = target["id"]
@@ -414,13 +521,15 @@ async def _auto_address_change(
         await update_branch(branch_id, token, **payload)
     except EposAPIError as e:
         logging.exception("update_branch failed in group address flow")
-        await message.reply(f"⚠️ update_branch: {html.escape(str(e))}")
+        await _safe_reply(message, f"⚠️ update_branch: {html.escape(str(e))}", "update_branch error")
         return
 
-    await message.reply(
+    await _safe_reply(
+        message,
         f"✅ Адрес обновлён.\n"
         f"<b>Было:</b> <code>{html.escape(api_address or '—')}</code>\n"
-        f"<b>Стало:</b> <code>{html.escape(new_address)}</code>"
+        f"<b>Стало:</b> <code>{html.escape(new_address)}</code>",
+        "address updated",
     )
 
     business_diller_id = _flatten_fk(business.get("diller"))
@@ -485,6 +594,25 @@ async def handle_group_prodleniya(message: types.Message):
     if not entries:
         return
 
+    # СЕРИАЛИЗАЦИЯ per-chat: если в тестовую группу разом закинули 20
+    # prodleniya-сообщений, обрабатываем их СТРОГО по очереди. Без этого
+    # каждый обработчик стартует в своей asyncio-таске, все параллельно
+    # долбят cazad / management pagination, и получаем «too many requests».
+    # Другие чаты продолжают работать независимо (лок per-chat).
+    async with _get_prod_chat_lock(message.chat.id):
+        await _process_prodleniya_locked(
+            message, entries, chat_diller_id
+        )
+
+
+async def _process_prodleniya_locked(
+    message: types.Message,
+    entries: list,
+    chat_diller_id: int,
+) -> None:
+    """Actual per-entry processing — must run under the chat's prodleniya
+    lock so that a burst of messages inside one chat doesn't hit APIs in
+    parallel and get throttled."""
     user = message.from_user
     full_name = html.escape(user.full_name)
     diller_name_sender = await get_user_diller_name(user.id) or "—"
@@ -508,97 +636,83 @@ async def handle_group_prodleniya(message: types.Message):
     for entry in entries:
         target_iso = entry["new_blocked_date"]
 
-        # Prodleniya spec: try each candidate fiscal in the entry. The first
-        # one that is found in at least one backend is the winner — we don't
-        # touch the rest (they're likely old/new copies of the same cashdesk).
-        winning: Optional[ProdOutcome] = None
-        outcomes: List[ProdOutcome] = []
+        # Каждый фискал в строке — отдельный кассовый аппарат. Раньше здесь
+        # был break после первого «found somewhere» под предположением, что
+        # это старый+новый фискал одной кассы; на практике пользователи
+        # пишут в одной строке несколько РАЗНЫХ касс («МЕГА КОИНОТ 6та»),
+        # и все они должны продлеваться на общую дату. Поэтому обходим
+        # ВСЕ фискалы независимо.
         for fn in entry["fiscals"]:
-            outcome = await process_fiscal(
+            o = await process_fiscal(
                 fn,
                 target_iso,
                 enqueue_context=enqueue_ctx,
             )
-            outcomes.append(outcome)
-            found_somewhere = (
-                outcome.cazad_skipped_reason not in (None, "not_found", "error")
-                or outcome.cazad_updated
-                or outcome.mgmt_skipped_reason not in (None, "not_found", "error")
-                or outcome.mgmt_updated
+
+            # Not found anywhere and no transient API error → сообщаем «не найден».
+            found_anywhere = (
+                o.cazad_updated
+                or o.mgmt_updated
+                or o.cazad_skipped_reason not in (None, "not_found", "error")
+                or o.mgmt_skipped_reason not in (None, "not_found", "error")
             )
-            if found_somewhere:
-                winning = outcome
-                break
+            if not found_anywhere:
+                first_err = o.cazad_error or o.mgmt_error
+                if first_err:
+                    errors.append((fn, first_err))
+                else:
+                    not_found.append(fn)
+                continue
 
-        if winning is None:
-            # Не найден нигде. Если попутно ловили API-ошибку — сообщим.
-            first_err = next(
-                (
-                    o.cazad_error or o.mgmt_error
-                    for o in outcomes
-                    if o.cazad_error or o.mgmt_error
-                ),
-                None,
-            )
-            if first_err:
-                errors.append((", ".join(entry["fiscals"]), first_err))
-            else:
-                not_found.append(", ".join(entry["fiscals"]))
-            continue
+            # Классификация исхода — какие бэкенды реально что-то поменяли.
+            both_up = o.cazad_updated and o.mgmt_updated
+            only_cazad = o.cazad_updated and not o.mgmt_updated
+            only_mgmt = o.mgmt_updated and not o.cazad_updated
 
-        o = winning
-        fn = o.fiscal
+            if both_up:
+                updated_both.append((fn, target_iso))
+            elif only_cazad:
+                updated_cazad.append((fn, target_iso))
+            elif only_mgmt:
+                updated_mgmt.append((fn, target_iso))
 
-        # Update result classification.
-        both_up = o.cazad_updated and o.mgmt_updated
-        only_cazad = o.cazad_updated and not o.mgmt_updated
-        only_mgmt = o.mgmt_updated and not o.cazad_updated
+            # No-op если оба бэкенда уже на нужной дате или дальше.
+            if (
+                not (o.cazad_updated or o.mgmt_updated)
+                and (o.cazad_skipped_reason == "no_op"
+                     or o.mgmt_skipped_reason == "no_op")
+            ):
+                current = o.cazad_current_iso or o.mgmt_current_iso or "—"
+                no_op.append((fn, str(current)[:10], target_iso))
 
-        if both_up:
-            updated_both.append((fn, target_iso))
-        elif only_cazad:
-            updated_cazad.append((fn, target_iso))
-        elif only_mgmt:
-            updated_mgmt.append((fn, target_iso))
+            if o.mgmt_skipped_reason == "queued":
+                queued.append((fn, target_iso))
 
-        # No-op if both backends already at/beyond target (nothing changed).
-        if (
-            not (o.cazad_updated or o.mgmt_updated)
-            and (o.cazad_skipped_reason == "no_op"
-                 or o.mgmt_skipped_reason == "no_op")
-        ):
-            current = o.cazad_current_iso or o.mgmt_current_iso or "—"
-            no_op.append((fn, str(current)[:10], target_iso))
+            if o.cazad_error:
+                errors.append((fn, f"cazad: {o.cazad_error}"))
+            if o.mgmt_error and o.mgmt_skipped_reason != "queued":
+                errors.append((fn, f"mgmt: {o.mgmt_error}"))
 
-        if o.mgmt_skipped_reason == "queued":
-            queued.append((fn, target_iso))
-
-        if o.cazad_error:
-            errors.append((fn, f"cazad: {o.cazad_error}"))
-        if o.mgmt_error and o.mgmt_skipped_reason != "queued":
-            errors.append((fn, f"mgmt: {o.mgmt_error}"))
-
-        # Log-groups notify — только когда block date реально изменилась
-        # хотя бы в одном бэкенде (cazad ИЛИ management). no_op не шлём.
-        if o.cazad_updated or o.mgmt_updated:
-            tin = o.business_tin or "—"
-            biz_name = o.business_name or "—"
-            summary = (
-                "🔒 <b>Обновлена дата блокировки</b>\n"
-                f"<b>Diller:</b> {html.escape(str(diller_name_sender))}\n"
-                f"<b>От:</b> {full_name} "
-                f"(id: <code>{user.id}</code>)\n\n"
-                f"<b>Фискальный номер:</b> <code>{html.escape(fn)}</code>\n"
-                f"<b>ИНН:</b> <code>{html.escape(str(tin))}</code>\n"
-                f"<b>Название бизнеса:</b> {html.escape(str(biz_name))}\n"
-                f"<b>Дата блокировки:</b> <code>{html.escape(target_iso)}</code>"
-            )
-            try:
-                await notify_log_groups(chat_diller_id, summary)
-            except Exception as exc:
-                logging.exception(
-                    f"group prodleniya notify_log_groups failed for {fn}: {exc}"
+            # Log-groups notify — только когда block date реально изменилась.
+            if o.cazad_updated or o.mgmt_updated:
+                tin = o.business_tin or "—"
+                biz_name = o.business_name or "—"
+                summary = (
+                    "🔒 <b>Обновлена дата блокировки</b>\n"
+                    f"<b>Diller:</b> {html.escape(str(diller_name_sender))}\n"
+                    f"<b>От:</b> {full_name} "
+                    f"(id: <code>{user.id}</code>)\n\n"
+                    f"<b>Фискальный номер:</b> <code>{html.escape(fn)}</code>\n"
+                    f"<b>ИНН:</b> <code>{html.escape(str(tin))}</code>\n"
+                    f"<b>Название бизнеса:</b> {html.escape(str(biz_name))}\n"
+                    f"<b>Дата блокировки:</b> <code>{html.escape(target_iso)}</code>"
                 )
+                try:
+                    await notify_log_groups(chat_diller_id, summary)
+                except Exception as exc:
+                    logging.exception(
+                        f"group prodleniya notify_log_groups failed for {fn}: {exc}"
+                    )
 
     # Build reply.
     def _fmt_list(rows, prefix_kv=False):
@@ -655,4 +769,7 @@ async def handle_group_prodleniya(message: types.Message):
         lines.append(f"\n👉 @{TECH_SUPPORT_USERNAME}, проверьте пожалуйста.")
 
     if lines:
-        await message.reply("\n".join(lines))
+        await _flood_safe(
+            lambda: message.reply("\n".join(lines)),
+            desc="prodleniya summary reply",
+        )

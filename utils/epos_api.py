@@ -1,4 +1,6 @@
+import asyncio
 import logging
+import time
 from typing import Any, Optional
 
 import aiohttp
@@ -8,6 +10,14 @@ from data import config
 from loader import db
 
 TOKEN_KEY = "epos_token"
+
+# Cazad бэкенд ограничивает число активных токенов на пользователя (порядка
+# нескольких десятков). Если 20+ обработчиков стартуют одновременно с
+# просроченным токеном, каждый уходит рефрешить и мы моментально сжигаем
+# квоту, получая 403 «Maximum amount of tokens allowed per user exceeded».
+# Cooldown + lock: ровно один рефреш в это окно, остальные ждут и берут
+# уже обновлённый токен из БД.
+_REFRESH_COOLDOWN_SEC = 30
 
 
 class EposAPIError(Exception):
@@ -23,41 +33,70 @@ class EposAPI:
         # инвалидируются при рестарте бота.
         self._cookie_jar: Optional[aiohttp.CookieJar] = None
 
+        # Refresh coalescing — единый lock и timestamp последнего успешного
+        # логина. Не даёт 20 параллельным хендлерам сжечь per-user token
+        # quota одновременными POST /auth/login/.
+        # Lock создаётся лениво на первом вызове refresh_token: на Py3.8
+        # asyncio.Lock() при __init__ ловил бы «attached to a different
+        # loop», т.к. loop ещё не запущен на этапе import модуля.
+        self._refresh_lock: Optional[asyncio.Lock] = None
+        self._last_refresh_at: float = 0.0
+
+    def _get_lock(self) -> asyncio.Lock:
+        if self._refresh_lock is None:
+            self._refresh_lock = asyncio.Lock()
+        return self._refresh_lock
+
     async def refresh_token(self) -> str:
         """
         Авторизоваться по телефону/паролю из .env, получить токен и сохранить
         его в БД (таблица `settings`, ключ `epos_token`).
 
-        Вызывается один раз — при первом обращении к API, либо повторно,
-        если текущий токен устарел (HTTP 401 на любом запросе).
-        Это единственное место, где выполняется POST на /auth/login/.
+        Если refresh уже был выполнен в течение последних
+        `_REFRESH_COOLDOWN_SEC` секунд (например, другим параллельным
+        хендлером в бурсте) — возвращаем текущий токен из БД без
+        повторного POST на /auth/login/. Это защищает от сжигания
+        per-user token quota на cazad.
         """
         if not config.EPOS_PHONE or not config.EPOS_PASSWORD:
             raise EposAPIError("EPOS_PHONE / EPOS_PASSWORD не заданы в .env")
 
-        payload = {
-            "phone": config.EPOS_PHONE,
-            "password": config.EPOS_PASSWORD,
-        }
-        async with aiohttp.ClientSession(
-            connector=aiohttp.TCPConnector(ssl=False)
-        ) as session:
-            async with session.post(self.auth_url, json=payload) as resp:
-                body = await resp.text()
-                if resp.status >= 400:
-                    raise EposAPIError(f"auth failed [{resp.status}]: {body}")
-                try:
-                    data = await resp.json(content_type=None)
-                except (aiohttp.ContentTypeError, ValueError):
-                    raise EposAPIError(f"auth response is not JSON: {body}")
+        async with self._get_lock():
+            # Пока мы ждали lock, другой воркер уже мог обновить токен.
+            elapsed = time.monotonic() - self._last_refresh_at
+            if elapsed < _REFRESH_COOLDOWN_SEC:
+                cached = await db.get_setting(TOKEN_KEY)
+                if cached:
+                    logging.debug(
+                        "E-POS refresh_token: skipped (last refresh %.1fs ago)",
+                        elapsed,
+                    )
+                    return cached
 
-        token = self._extract_token(data)
-        if not token:
-            raise EposAPIError(f"токен не найден в ответе: {data}")
+            payload = {
+                "phone": config.EPOS_PHONE,
+                "password": config.EPOS_PASSWORD,
+            }
+            async with aiohttp.ClientSession(
+                connector=aiohttp.TCPConnector(ssl=False)
+            ) as session:
+                async with session.post(self.auth_url, json=payload) as resp:
+                    body = await resp.text()
+                    if resp.status >= 400:
+                        raise EposAPIError(f"auth failed [{resp.status}]: {body}")
+                    try:
+                        data = await resp.json(content_type=None)
+                    except (aiohttp.ContentTypeError, ValueError):
+                        raise EposAPIError(f"auth response is not JSON: {body}")
 
-        await db.set_setting(TOKEN_KEY, token)
-        logging.info("E-POS токен сохранён в БД")
-        return token
+            token = self._extract_token(data)
+            if not token:
+                raise EposAPIError(f"токен не найден в ответе: {data}")
+
+            await db.set_setting(TOKEN_KEY, token)
+            self._last_refresh_at = time.monotonic()
+            logging.info("E-POS токен сохранён в БД")
+            return token
 
     @staticmethod
     def _extract_token(data: Any) -> Optional[str]:
