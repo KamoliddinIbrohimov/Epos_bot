@@ -22,6 +22,7 @@ async def on_startup(dispatcher):
         await db.create_table_dillers()
         await db.create_table_diller_chats()
         await db.create_table_prodleniya_pending()
+        await db.create_table_holidays()
 
         await set_default_commands(dispatcher)
         await on_startup_notify(dispatcher)

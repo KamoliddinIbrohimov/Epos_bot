@@ -7,6 +7,7 @@ from . import dillers
 from . import attach_business
 from . import bulk_block_dates
 from . import settings
+from . import holidays
 from . import find_business
 from . import state_control
 from . import echo

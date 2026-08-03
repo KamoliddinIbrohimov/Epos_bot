@@ -11,15 +11,24 @@ from keyboards.default.admin import (
     ADD_DILLER_BTN,
     ADD_VIRTUAL_NUMBERS_BTN,
     ATTACH_BUSINESS_BTN,
+    HOLIDAYS_BTN,
+    SETTINGS_BTN,
 )
 from loader import bot, db, dp
+from utils.date_utils import adjust_block_date
 from utils.diller import get_user_diller_name
 from utils.epos_api import EposAPIError, authed_http, epos_api
 from utils.notify_groups import notify_log_groups
 from utils.state_control import prompt_continue_or_exit, save_prompt
 
 # Тексты reply-кнопок, которые не должны трактоваться как фискальный номер.
-_BUTTON_TEXTS = {ADD_VIRTUAL_NUMBERS_BTN, ADD_DILLER_BTN, ATTACH_BUSINESS_BTN}
+_BUTTON_TEXTS = {
+    ADD_VIRTUAL_NUMBERS_BTN,
+    ADD_DILLER_BTN,
+    ATTACH_BUSINESS_BTN,
+    SETTINGS_BTN,
+    HOLIDAYS_BTN,
+}
 
 UPDATABLE_FIELDS = (
     "name",
@@ -178,7 +187,16 @@ async def pick_business_date(
     branch = data.get("branch", "—")
     business = data.get("business") or {}
     business_id = data.get("business_id")
-    blocked_date = picked.strftime("%Y-%m-%d")
+
+    original_date = picked.date() if hasattr(picked, "date") else picked
+    holidays = await db.get_holidays()
+    adjusted = adjust_block_date(original_date, holidays)
+    blocked_date = adjusted.strftime("%Y-%m-%d")
+    date_note = (
+        f"\n\n📝 Дата скорректирована: {original_date} → {blocked_date}"
+        if adjusted != original_date
+        else ""
+    )
 
     payload = {
         key: _flatten_fk(business.get(key))
@@ -200,6 +218,7 @@ async def pick_business_date(
     await callback.message.edit_text(
         "✅ Business успешно обновлён\n\n"
         + _summary(name, tin, branch, blocked_date)
+        + date_note
     )
 
     user = callback.from_user

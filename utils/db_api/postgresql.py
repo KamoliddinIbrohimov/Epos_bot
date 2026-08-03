@@ -453,3 +453,33 @@ class Database:
             "DELETE FROM dillers WHERE id = $1",
             diller_id, execute=True,
         )
+
+    # ------------------------------------------------------------------
+    # Holidays (bayram kunlari) — block dates must not fall on these days.
+    # ------------------------------------------------------------------
+
+    async def create_table_holidays(self):
+        sql = """
+        CREATE TABLE IF NOT EXISTS holidays (
+            id DATE PRIMARY KEY
+        );
+        """
+        await self.execute(sql, execute=True)
+
+    async def add_holiday(self, d) -> None:
+        sql = "INSERT INTO holidays (id) VALUES ($1) ON CONFLICT DO NOTHING"
+        await self.execute(sql, d, execute=True)
+
+    async def remove_holiday(self, d) -> None:
+        sql = "DELETE FROM holidays WHERE id = $1"
+        await self.execute(sql, d, execute=True)
+
+    async def get_holidays(self) -> set:
+        sql = "SELECT id FROM holidays"
+        rows = await self.execute(sql, fetch=True)
+        return {r["id"] for r in (rows or [])}
+
+    async def list_holidays(self) -> list:
+        sql = "SELECT id FROM holidays ORDER BY id"
+        rows = await self.execute(sql, fetch=True)
+        return [r["id"] for r in (rows or [])]

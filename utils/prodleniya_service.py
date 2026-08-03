@@ -29,6 +29,7 @@ from datetime import date, datetime, timedelta
 from typing import List, Optional, Tuple
 
 from loader import db
+from utils.date_utils import adjust_block_date
 from utils.epos_api import EposAPIError, epos_api
 from utils.epos_management_api import (
     EposMgmtAPIError,
@@ -290,6 +291,12 @@ async def process_fiscal(
     enqueue_context: Optional[dict] = None,
 ) -> ProdOutcome:
     """Process one fiscal against both backends in parallel."""
+    target_d = _iso_to_date(target_iso)
+    if target_d:
+        holidays = await db.get_holidays()
+        target_d = adjust_block_date(target_d, holidays)
+        target_iso = target_d.isoformat()
+
     outcome = ProdOutcome(fiscal=fiscal, target_iso=target_iso)
     await asyncio.gather(
         _apply_cazad(fiscal, target_iso, outcome),

@@ -31,6 +31,7 @@ from handlers.users.business import (
     update_business,
 )
 from loader import db, dp
+from utils.date_utils import adjust_block_date
 from utils.diller import get_user_diller_name
 from utils.epos_api import EposAPIError, epos_api
 from utils.notify_groups import notify_log_groups
@@ -249,6 +250,8 @@ async def bbd_confirm(callback: types.CallbackQuery, state: FSMContext):
         await callback.answer()
         return
 
+    holidays = await db.get_holidays()
+
     # Лениво — не тянем во время import (порядок регистрации хендлеров).
     from handlers.users.find_business import _branch_text, _summary, get_business_by_name
 
@@ -278,6 +281,9 @@ async def bbd_confirm(callback: types.CallbackQuery, state: FSMContext):
         if not is_admin and current_diller not in diller_ids:
             skipped_other.append(fn)
             continue
+
+        adjusted = adjust_block_date(date.fromisoformat(blocked_iso), holidays)
+        blocked_iso = adjusted.isoformat()
 
         payload = {
             key: _flatten_fk(business.get(key))
