@@ -18,6 +18,7 @@ OTP / verificationToken не требуются для аккаунтов без
 import asyncio
 import logging
 import time
+from datetime import date, timedelta
 from typing import Any, Optional
 
 import aiohttp
@@ -38,15 +39,16 @@ class EposMgmtAPIError(Exception):
 
 
 class EposMgmtCashdeskNotFound(EposMgmtAPIError):
-    """Пейджинг закончился, а cashdesk с нужным fiscalID так и не встретился."""
+    """GET /v1/cashdesks/fiscal/{id} 404 — fiscal ID management'da yo'q."""
+
+
+class EposMgmtFiscalModuleNotFound(EposMgmtAPIError):
+    """PATCH block-date 404 FISCAL_MODULE_NOT_FOUND — cashdesk bor lekin
+    fiskal modul o'chirilgan/detach bo'lgan. Retry befoyda."""
 
 
 def _to_day_first(date_str: str) -> str:
-    """`YYYY-MM-DD` -> `DD.MM.YYYY`; иначе возвращает как есть.
-
-    Управленческий бэкенд `getParsedDate` некорректно разворачивает
-    ISO-строки (случайно даёт правильный результат — но полагаться нельзя),
-    поэтому нормализуем к day-first формату сами."""
+    """`YYYY-MM-DD` → `DD.MM.YYYY`; aks holda qoldiradi."""
     s = (date_str or "").strip()
     if len(s) == 10 and s[4] == "-" and s[7] == "-" and s[:4].isdigit():
         y, m, d = s.split("-")
@@ -54,22 +56,44 @@ def _to_day_first(date_str: str) -> str:
     return s
 
 
+def _parse_date(date_str: str) -> date:
+    """`YYYY-MM-DD` yoki `DD.MM.YYYY` → `date` ob'ekti."""
+    s = (date_str or "").strip()
+    if len(s) == 10:
+        if s[4] == "-":
+            return date.fromisoformat(s)
+        if s[2] == ".":
+            d, m, y = s.split(".")
+            return date(int(y), int(m), int(d))
+    raise ValueError(f"Noto'g'ri sana format: {date_str!r}")
+
+
+def _fmt_day_first(d: date) -> str:
+    return d.strftime("%d.%m.%Y")
+
+
 class EposManagementAPI:
     def __init__(self):
         self.base_url = config.EPOS_MGMT_API_URL.rstrip("/")
         self.auth_url = f"{self.base_url}/v1/users/authorize"
 
-        # Refresh coalescing: единый lock и timestamp последнего логина.
-        # Защищает от одновременных POST /authorize в бурсте параллельных
-        # хендлеров. Lock создаётся лениво (Py3.8 привязывает asyncio.Lock
-        # к текущему loop; при импорте модуля loop ещё нет).
         self._refresh_lock: Optional[asyncio.Lock] = None
         self._last_refresh_at: float = 0.0
+        # Persistent session — DNS/TCP/TLS har safar qayta o'rnatilmaydi.
+        # Lazily yaratiladi (event loop import paytida bo'lmasligi mumkin).
+        self._session: Optional[aiohttp.ClientSession] = None
 
     def _get_lock(self) -> asyncio.Lock:
         if self._refresh_lock is None:
             self._refresh_lock = asyncio.Lock()
         return self._refresh_lock
+
+    def _get_session(self) -> aiohttp.ClientSession:
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession(
+                connector=aiohttp.TCPConnector(ssl=False, limit=10),
+            )
+        return self._session
 
     async def refresh_token(self) -> str:
         """Логин по .env, извлекаем accessToken, сохраняем в БД.
@@ -106,21 +130,19 @@ class EposManagementAPI:
             if config.EPOS_MGMT_VERIFICATION_TOKEN:
                 payload["verificationToken"] = config.EPOS_MGMT_VERIFICATION_TOKEN
 
-            async with aiohttp.ClientSession(
-                connector=aiohttp.TCPConnector(ssl=False)
-            ) as session:
-                async with session.post(self.auth_url, json=payload) as resp:
-                    body = await resp.text()
-                    if resp.status >= 400:
-                        raise EposMgmtAPIError(
-                            f"mgmt auth failed [{resp.status}]: {body}"
-                        )
-                    try:
-                        data = await resp.json(content_type=None)
-                    except (aiohttp.ContentTypeError, ValueError):
-                        raise EposMgmtAPIError(
-                            f"mgmt auth response is not JSON: {body}"
-                        )
+            session = self._get_session()
+            async with session.post(self.auth_url, json=payload) as resp:
+                body = await resp.text()
+                if resp.status >= 400:
+                    raise EposMgmtAPIError(
+                        f"mgmt auth failed [{resp.status}]: {body}"
+                    )
+                try:
+                    data = await resp.json(content_type=None)
+                except (aiohttp.ContentTypeError, ValueError):
+                    raise EposMgmtAPIError(
+                        f"mgmt auth response is not JSON: {body}"
+                    )
 
             token = self._extract_token(data)
             if not token:
@@ -181,30 +203,28 @@ class EposManagementAPI:
 
         for attempt in range(2):
             headers = {"Authorization": f"Bearer {token}"}
-            async with aiohttp.ClientSession(
-                connector=aiohttp.TCPConnector(ssl=False)
-            ) as session:
-                async with session.request(
-                    method, url, json=json, headers=headers
-                ) as resp:
-                    text = await resp.text()
-                    if resp.status in (401, 403) and attempt == 0:
-                        logging.warning(
-                            "mgmt %s -> [%s], refreshing token and retrying",
-                            url, resp.status,
-                        )
-                        token = await self.refresh_token()
-                        continue
-                    if resp.status >= 400:
-                        raise EposMgmtAPIError(
-                            f"{method} {url} [{resp.status}]: {text}"
-                        )
-                    if not text:
-                        return None
-                    try:
-                        return await resp.json(content_type=None)
-                    except (aiohttp.ContentTypeError, ValueError):
-                        return text
+            session = self._get_session()
+            async with session.request(
+                method, url, json=json, headers=headers
+            ) as resp:
+                text = await resp.text()
+                if resp.status in (401, 403) and attempt == 0:
+                    logging.warning(
+                        "mgmt %s -> [%s], refreshing token and retrying",
+                        url, resp.status,
+                    )
+                    token = await self.refresh_token()
+                    continue
+                if resp.status >= 400:
+                    raise EposMgmtAPIError(
+                        f"{method} {url} [{resp.status}]: {text}"
+                    )
+                if not text:
+                    return None
+                try:
+                    return await resp.json(content_type=None)
+                except (aiohttp.ContentTypeError, ValueError):
+                    return text
 
         raise EposMgmtAPIError(f"{method} {url}: auth retry exhausted")
 
@@ -212,84 +232,110 @@ class EposManagementAPI:
     # High-level endpoints
     # ---------------------------------------------------------------
 
-    async def get_cashdesk_by_fiscal(
-        self,
-        fiscal_id: str,
-        *,
-        page_limit: int = 50,
-        max_pages: int = 60,
-    ) -> dict:
-        """Найти cashdesk по fiscalID и вернуть его doc целиком.
+    async def get_cashdesk_by_fiscal(self, fiscal_id: str) -> dict:
+        """GET /v1/cashdesks/fiscal/{fiscalId} — to'g'ridan qidirish.
 
-        Сервер игнорирует ?fiscalId= (кладёт его в query, но фильтрацию
-        не делает — возвращает первую страницу всей коллекции ~2850 доков),
-        поэтому листаем страницы и ищем совпадение по
-        `doc.fiscalModule.fiscalID` на клиенте.
-
-        Не нашли до конца пагинации (либо до `max_pages`) → EposMgmtCashdeskNotFound.
-        Пустой fiscal_id → EposMgmtAPIError.
+        Yangi dedicated endpoint (eski ?fiscalId= pagination o'rniga).
+        404 → EposMgmtCashdeskNotFound.
         """
         if not fiscal_id:
             raise EposMgmtAPIError("fiscal_id пустой")
 
-        page = 1
-        scanned = 0
-        while page <= max_pages:
-            resp = await self.request(
-                "GET",
-                f"/v1/cashdesks?fiscalId={fiscal_id}"
-                f"&page={page}&limit={page_limit}",
-            )
-            data = (resp or {}).get("data") or {}
-            docs = data.get("docs") or []
-            scanned += len(docs)
-            for doc in docs:
-                fm = doc.get("fiscalModule") or {}
-                if fm.get("fiscalID") == fiscal_id:
-                    return doc
-            if not data.get("hasNextPage"):
+        try:
+            resp = await self.request("GET", f"/v1/cashdesks/fiscal/{fiscal_id}")
+        except EposMgmtAPIError as e:
+            if "[404]" in str(e):
                 raise EposMgmtCashdeskNotFound(
-                    f"cashdesk с fiscalID={fiscal_id} не найден "
-                    f"(просмотрено {scanned} записей)"
-                )
-            page += 1
+                    f"cashdesk fiscalID={fiscal_id} management'da topilmadi"
+                ) from e
+            raise
 
-        raise EposMgmtCashdeskNotFound(
-            f"cashdesk с fiscalID={fiscal_id} не найден "
-            f"(достигнут лимит max_pages={max_pages}, просмотрено {scanned})"
-        )
+        doc = (resp or {}).get("data") or resp
+        if not isinstance(doc, dict) or not doc:
+            raise EposMgmtCashdeskNotFound(
+                f"cashdesk fiscalID={fiscal_id}: kutilmagan javob {resp!r}"
+            )
+        return doc
+
+    async def create_fiscal_module(
+        self,
+        fiscal_id: str,
+        virtual_id: str,
+        comment: str = "",
+    ) -> dict:
+        """POST /v1/fiscalmodule/create — yangi fiskal modulni bazaga qo'shadi.
+
+        fiscal_id  — fiskal raqami (masalan LG420230650187)
+        virtual_id — zavod seriya raqami (masalan 312325)
+        """
+        if not fiscal_id:
+            raise EposMgmtAPIError("fiscal_id bo'sh")
+        if not virtual_id:
+            raise EposMgmtAPIError("virtual_id bo'sh")
+
+        body = {
+            "fiscalID": fiscal_id,
+            "virtualID": str(virtual_id),
+            "comment": comment or "",
+        }
+        resp = await self.request("POST", "/v1/fiscalmodule/create", json=body)
+        return (resp or {}).get("data") or resp or {}
 
     async def update_cashdesk_block_date(
         self,
-        cashdesk_id: str,
+        fiscal_id: str,
         block_date: str,
         expired_at: Optional[str] = None,
     ) -> dict:
-        """PATCH /v1/cashdesks/{_id}/block-date — обновляет только
-        licence.blockDate (и опционально licence.expiresAt).
+        """PATCH /v1/cashdesks/{fiscalId}/block-date
 
-        Path требует MongoDB _id (24 hex, из cashdesk['_id']), не fiscalID
-        — иначе 400 CastError. Даты принимаются как 'DD.MM.YYYY' или
-        'YYYY-MM-DD' (второе автоматически конвертится в day-first).
+        API o'zgardi:
+        - Path'da endi MongoDB _id emas, to'g'ridan fiscalId ishlatiladi.
+        - expiredAt majburiy: blockDate dan kamida 1 kun keyin bo'lishi shart.
+          Agar berilmasa — blockDate + 1 kun avtomatik qo'yiladi.
 
-        Возвращает полный обновлённый doc из data.
+        Sana formatlar: 'YYYY-MM-DD' yoki 'DD.MM.YYYY' (ikkalasi qabul qilinadi).
         """
-        if not cashdesk_id:
-            raise EposMgmtAPIError("cashdesk_id пустой")
+        if not fiscal_id:
+            raise EposMgmtAPIError("fiscal_id пустой")
         if not block_date:
             raise EposMgmtAPIError("block_date пустой")
 
-        body = {"blockDate": _to_day_first(block_date)}
-        if expired_at:
-            # ⚠️ В request'е ключ 'expiredAt' (past tense), а в response
-            # придёт как 'expiresAt' — так задумано серверной командой.
-            body["expiredAt"] = _to_day_first(expired_at)
+        try:
+            block_d = _parse_date(block_date)
+        except ValueError as e:
+            raise EposMgmtAPIError(str(e)) from e
 
-        resp = await self.request(
-            "PATCH",
-            f"/v1/cashdesks/{cashdesk_id}/block-date",
-            json=body,
-        )
+        if expired_at:
+            try:
+                exp_d = _parse_date(expired_at)
+            except ValueError as e:
+                raise EposMgmtAPIError(str(e)) from e
+            if exp_d <= block_d:
+                raise EposMgmtAPIError(
+                    f"expiredAt ({expired_at}) blockDate ({block_date}) dan katta bo'lishi shart"
+                )
+        else:
+            exp_d = block_d + timedelta(days=1)
+
+        body = {
+            "blockDate": _fmt_day_first(block_d),
+            "expiredAt": _fmt_day_first(exp_d),
+        }
+
+        try:
+            resp = await self.request(
+                "PATCH",
+                f"/v1/cashdesks/{fiscal_id}/block-date",
+                json=body,
+            )
+        except EposMgmtAPIError as e:
+            msg = str(e)
+            if "[404]" in msg or "FISCAL_MODULE_NOT" in msg:
+                raise EposMgmtFiscalModuleNotFound(
+                    f"fiscal {fiscal_id}: fiskal modul management'da yo'q"
+                ) from e
+            raise
         return (resp or {}).get("data") or {}
 
 

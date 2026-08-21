@@ -14,6 +14,7 @@ from data import config
 from loader import bot, db, dp
 from utils.diller import get_user_diller_name
 from utils.epos_api import EposAPIError, authed_http, epos_api
+from utils.epos_management_api import EposMgmtAPIError, epos_mgmt_api
 from utils.notify_groups import notify_log_groups
 from utils.parse_pdf import PdfParseError, format_analysis, parse_business_pdf
 from utils.state_control import prompt_continue_or_exit, save_prompt
@@ -53,12 +54,14 @@ class FiscalModule(StatesGroup):
 
 
 class NewClientClaim(StatesGroup):
+    waiting_for_program_type = State()
     waiting_for_auth_key = State()
     confirming = State()
 
 
 fiscal_cb = CallbackData("fisk", "action")
 new_client_cb = CallbackData("newc", "action")
+program_type_cb = CallbackData("ptype", "ptype")
 
 
 def fiscal_confirm_keyboard() -> InlineKeyboardMarkup:
@@ -69,6 +72,21 @@ def fiscal_confirm_keyboard() -> InlineKeyboardMarkup:
         ),
         InlineKeyboardButton(
             "🔄 Отправить заново", callback_data=fiscal_cb.new(action="resend")
+        ),
+    )
+    return kb
+
+
+def program_type_keyboard() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton(
+            "🖥 Communicator",
+            callback_data=program_type_cb.new(ptype="communicator"),
+        ),
+        InlineKeyboardButton(
+            "🖨 Cashdesk",
+            callback_data=program_type_cb.new(ptype="cashdesk"),
         ),
     )
     return kb
@@ -601,18 +619,100 @@ async def _maybe_start_new_client_flow(
         nc_doc_file_id=doc_file_id,
         nc_analysis_text=analysis_text,
     )
-    await NewClientClaim.waiting_for_auth_key.set()
+    await NewClientClaim.waiting_for_program_type.set()
     prompt = (
-        f"📋 <b>Привязка нового клиента</b>\n"
+        f"📋 <b>Yangi mijoz — dastur turini tanlang</b>\n\n"
         f"<b>Virtual raqam:</b> <code>{html.escape(str(virtual_number))}</code>\n"
         f"<b>Fiskal raqam:</b> <code>{html.escape(str(new_fiscal))}</code>\n"
         f"<b>Diller:</b> <code>{html.escape(str(diller_name))}</code>\n"
         f"<b>Firma nomi:</b> <code>{html.escape(str(organization))}</code>\n"
-        f"<b>Faoliyat turi:</b> <code>{html.escape(str(activity_type))}</code>\n\n"
-        f"Отправьте <b>auth key</b>:"
+        f"<b>Faoliyat turi:</b> <code>{html.escape(str(activity_type))}</code>"
     )
     await save_prompt(state, prompt)
-    await message.answer(prompt)
+    await message.answer(prompt, reply_markup=program_type_keyboard())
+
+
+@dp.callback_query_handler(
+    program_type_cb.filter(),
+    state=NewClientClaim.waiting_for_program_type,
+)
+async def on_program_type_selected(
+    callback: types.CallbackQuery,
+    callback_data: dict,
+    state: FSMContext,
+):
+    ptype = callback_data["ptype"]
+    data = await state.get_data()
+
+    if ptype == "communicator":
+        await NewClientClaim.waiting_for_auth_key.set()
+        prompt = "Отправьте <b>auth key</b>:"
+        await save_prompt(state, prompt)
+        await callback.message.edit_text(
+            callback.message.html_text + "\n\n🖥 <b>Communicator</b> tanlandi.\n\n" + prompt
+        )
+        await callback.answer()
+        return
+
+    # cashdesk yo'li
+    fiscal_id = data.get("nc_new_fiscal") or ""
+    virtual_id = data.get("nc_virtual_number") or ""
+    organization = data.get("nc_organization") or ""
+
+    if not fiscal_id or not virtual_id:
+        await callback.message.edit_text(
+            "⚠️ Fiskal yoki virtual raqam topilmadi. PDF'ni qayta yuboring."
+        )
+        await state.finish()
+        await callback.answer()
+        return
+
+    await callback.message.edit_text(
+        callback.message.html_text
+        + "\n\n🖨 <b>Cashdesk</b> tanlandi. Management bazasiga qo'shilmoqda..."
+    )
+    await callback.answer()
+
+    try:
+        await epos_mgmt_api.create_fiscal_module(
+            fiscal_id=fiscal_id,
+            virtual_id=str(virtual_id),
+            comment=organization,
+        )
+    except EposMgmtAPIError as e:
+        await callback.message.edit_text(
+            f"❌ Management API xatosi:\n<code>{html.escape(str(e))}</code>"
+        )
+        await state.finish()
+        return
+
+    await callback.message.edit_text(
+        f"✅ <b>Cashdesk bazaga qo'shildi</b>\n\n"
+        f"<b>Fiskal raqam:</b> <code>{html.escape(fiscal_id)}</code>\n"
+        f"<b>Virtual raqam:</b> <code>{html.escape(str(virtual_id))}</code>\n"
+        f"<b>Firma:</b> {html.escape(organization)}"
+    )
+
+    user = callback.from_user
+    user_diller_id = data.get("nc_user_diller_id")
+    diller_name = data.get("nc_diller_name") or "—"
+    stir = data.get("nc_stir") or "—"
+    summary = (
+        f"🖨 <b>Yangi Cashdesk qo'shildi</b>\n"
+        f"<b>Diller:</b> {html.escape(str(diller_name))}\n"
+        f'От: <a href="tg://user?id={user.id}">{html.escape(user.full_name)}</a> '
+        f"(id: <code>{user.id}</code>)\n\n"
+        f"<b>Fiskal raqam:</b> <code>{html.escape(fiscal_id)}</code>\n"
+        f"<b>Virtual raqam:</b> <code>{html.escape(str(virtual_id))}</code>\n"
+        f"<b>STIR:</b> <code>{html.escape(str(stir))}</code>\n"
+        f"<b>Firma:</b> {html.escape(organization)}"
+    )
+    try:
+        await notify_log_groups(user_diller_id, summary)
+    except Exception as exc:
+        logging.exception(f"cashdesk notify_log_groups failed: {exc}")
+
+    await state.finish()
 
 
 @dp.message_handler(

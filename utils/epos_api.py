@@ -41,11 +41,20 @@ class EposAPI:
         # loop», т.к. loop ещё не запущен на этапе import модуля.
         self._refresh_lock: Optional[asyncio.Lock] = None
         self._last_refresh_at: float = 0.0
+        # Persistent session — TCP ulanish qayta yaratilmaydi
+        self._session: Optional[aiohttp.ClientSession] = None
 
     def _get_lock(self) -> asyncio.Lock:
         if self._refresh_lock is None:
             self._refresh_lock = asyncio.Lock()
         return self._refresh_lock
+
+    def _get_session(self) -> aiohttp.ClientSession:
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession(
+                connector=aiohttp.TCPConnector(ssl=False, limit=10),
+            )
+        return self._session
 
     async def refresh_token(self) -> str:
         """
@@ -77,17 +86,15 @@ class EposAPI:
                 "phone": config.EPOS_PHONE,
                 "password": config.EPOS_PASSWORD,
             }
-            async with aiohttp.ClientSession(
-                connector=aiohttp.TCPConnector(ssl=False)
-            ) as session:
-                async with session.post(self.auth_url, json=payload) as resp:
-                    body = await resp.text()
-                    if resp.status >= 400:
-                        raise EposAPIError(f"auth failed [{resp.status}]: {body}")
-                    try:
-                        data = await resp.json(content_type=None)
-                    except (aiohttp.ContentTypeError, ValueError):
-                        raise EposAPIError(f"auth response is not JSON: {body}")
+            session = self._get_session()
+            async with session.post(self.auth_url, json=payload) as resp:
+                body = await resp.text()
+                if resp.status >= 400:
+                    raise EposAPIError(f"auth failed [{resp.status}]: {body}")
+                try:
+                    data = await resp.json(content_type=None)
+                except (aiohttp.ContentTypeError, ValueError):
+                    raise EposAPIError(f"auth response is not JSON: {body}")
 
             token = self._extract_token(data)
             if not token:
@@ -148,23 +155,21 @@ class EposAPI:
         token = await self.get_token()
 
         headers = {"Authorization": f"Token {token}"}
-        async with aiohttp.ClientSession(
-            connector=aiohttp.TCPConnector(ssl=False)
-        ) as session:
-            async with session.request(
-                method, url, json=json, headers=headers
-            ) as resp:
-                text = await resp.text()
-                if resp.status >= 400:
-                    raise EposAPIError(
-                        f"{method} {url} [{resp.status}]: {text}"
-                    )
-                if not text:
-                    return None
-                try:
-                    return await resp.json(content_type=None)
-                except (aiohttp.ContentTypeError, ValueError):
-                    return text
+        session = self._get_session()
+        async with session.request(
+            method, url, json=json, headers=headers
+        ) as resp:
+            text = await resp.text()
+            if resp.status >= 400:
+                raise EposAPIError(
+                    f"{method} {url} [{resp.status}]: {text}"
+                )
+            if not text:
+                return None
+            try:
+                return await resp.json(content_type=None)
+            except (aiohttp.ContentTypeError, ValueError):
+                return text
 
     async def get_business(self, virtual_number: str) -> Any:
         """Fetch business info by virtual_number (zavod number)."""
@@ -179,30 +184,42 @@ class EposAPI:
     # ---------------------------------------------------------------
 
     async def session_login(self) -> aiohttp.CookieJar:
-        """POST /auth/login/ как делает Swagger UI: ловим выставленные
-        сервером cookies (sessionid + csrftoken) и сохраняем их в памяти.
-        Затем эти cookies используются в billing_request()."""
-        if not config.EPOS_PHONE or not config.EPOS_PASSWORD:
-            raise EposAPIError("EPOS_PHONE / EPOS_PASSWORD не заданы в .env")
-
-        payload = {
-            "phone": config.EPOS_PHONE,
-            "password": config.EPOS_PASSWORD,
-        }
+        """Django admin orqali session olish — DRF token quota sarflamaydi."""
+        admin_url = f"{self.base_url}/admin/login/"
         jar = aiohttp.CookieJar(unsafe=True)
+
         async with aiohttp.ClientSession(
             cookie_jar=jar,
             connector=aiohttp.TCPConnector(ssl=False),
         ) as session:
-            async with session.post(self.auth_url, json=payload) as resp:
+            # 1. CSRF tokenini oling
+            async with session.get(admin_url) as r0:
+                html = await r0.text()
+
+            import re as _re
+            m = _re.search(r'csrfmiddlewaretoken.*?value=["\']([^"\']+)', html)
+            csrf = m.group(1) if m else ""
+
+            # 2. Admin login
+            async with session.post(
+                admin_url,
+                data={
+                    "username": "admin",
+                    "password": config.EPOS_PASSWORD,
+                    "csrfmiddlewaretoken": csrf,
+                    "next": "/admin/",
+                },
+                headers={"Referer": admin_url},
+            ) as resp:
                 body = await resp.text()
-                if resp.status >= 400:
+                cookies = jar.filter_cookies(URL(self.base_url))
+                if not cookies.get("sessionid"):
                     raise EposAPIError(
-                        f"session login failed [{resp.status}]: {body}"
+                        f"admin session login failed [{resp.status}]: sessionid not set"
                     )
 
         self._cookie_jar = jar
-        logging.info("E-POS session login OK")
+        logging.info("E-POS admin session login OK")
         return jar
 
     def _get_csrf(self) -> Optional[str]:
@@ -247,7 +264,7 @@ class EposAPI:
                 async with session.request(
                     method, url, json=json, headers=headers
                 ) as resp:
-                    if resp.status in (401, 403) and attempt == 0:
+                    if resp.status == 401 and attempt == 0:
                         await self.session_login()
                         continue
                     text = await resp.text()

@@ -34,6 +34,7 @@ from utils.epos_api import EposAPIError, epos_api
 from utils.epos_management_api import (
     EposMgmtAPIError,
     EposMgmtCashdeskNotFound,
+    EposMgmtFiscalModuleNotFound,
     epos_mgmt_api,
 )
 
@@ -53,18 +54,16 @@ def _iso_to_date(s: Optional[str]) -> Optional[date]:
 
 
 def _is_transient_mgmt_error(exc: BaseException) -> bool:
-    """Everything that's NOT a clean 'cashdesk not found' from management
-    is treated as transient — 5xx, network errors, timeouts and unexpected
-    payloads all end up in the retry queue.
+    """Everything that's NOT a clean 'not found' is treated as transient.
 
-    Rationale: management site freezes intermittently (per ops), and
-    retries every ~2 min recover on their own once it's back.
+    Non-transient (no retry):
+      - EposMgmtCashdeskNotFound   — fiscal ID management'da yo'q
+      - EposMgmtFiscalModuleNotFound — cashdesk bor lekin FM detach/o'chirilgan
     """
-    if isinstance(exc, EposMgmtCashdeskNotFound):
+    if isinstance(exc, (EposMgmtCashdeskNotFound, EposMgmtFiscalModuleNotFound)):
         return False
     if isinstance(exc, EposMgmtAPIError):
         return True
-    # asyncio timeouts, aiohttp errors, generic OS errors — all transient.
     return isinstance(exc, (asyncio.TimeoutError, OSError))
 
 
@@ -251,9 +250,13 @@ async def _apply_management(
 
     try:
         await epos_mgmt_api.update_cashdesk_block_date(
-            cashdesk_id=doc["_id"],
+            fiscal_id=fiscal,
             block_date=target_iso,
         )
+    except EposMgmtFiscalModuleNotFound as e:
+        outcome.mgmt_skipped_reason = "not_found"
+        outcome.mgmt_error = str(e)
+        return
     except (EposMgmtAPIError, asyncio.TimeoutError, OSError) as e:
         outcome.mgmt_error = str(e)
         if enqueue_context is not None and _is_transient_mgmt_error(e):
@@ -371,9 +374,21 @@ async def retry_pending_once(bot) -> None:
 
         try:
             await epos_mgmt_api.update_cashdesk_block_date(
-                cashdesk_id=doc["_id"],
+                fiscal_id=fiscal,
                 block_date=target_iso,
             )
+        except EposMgmtFiscalModuleNotFound as e:
+            await db.mark_prodleniya_giveup(row["id"], str(e))
+            try:
+                await bot.send_message(
+                    row["chat_id"],
+                    f"❌ Отложенное продление: <code>{fiscal}</code> — "
+                    f"fiskal modul management'da topilmadi. Texnik jamoaga murojaat qiling.",
+                    reply_to_message_id=row["message_id"],
+                )
+            except Exception:
+                pass
+            continue
         except (EposMgmtAPIError, asyncio.TimeoutError, OSError) as e:
             await _reschedule_or_giveup(row, str(e), MAX_ATTEMPTS, RETRY_INTERVAL_SEC, bot)
             continue

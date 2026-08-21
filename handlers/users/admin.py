@@ -1,4 +1,5 @@
 import io
+import logging
 from datetime import date, datetime
 
 import xlwt
@@ -121,11 +122,12 @@ async def add_virtual_numbers(call: types.CallbackQuery, state: FSMContext):
     numbers = []
     try:
         for i in range(count):
-            response = await epos_api.request(
+            response = await epos_api.billing_request(
                 "POST",
                 "/billing/api/v3/business/",
                 json=NEW_BUSINESS_PAYLOAD,
             )
+            logging.info("billing_request response (i=%s): %r", i, response)
             virtual_number = _extract_virtual_number(response)
             if virtual_number is None:
                 await progress.edit_text(
@@ -135,7 +137,18 @@ async def add_virtual_numbers(call: types.CallbackQuery, state: FSMContext):
                 return
             numbers.append(virtual_number)
     except EposAPIError as e:
-        await progress.edit_text(f"API вернул ошибку: {e}")
+        logging.error("virtual_numbers billing_request failed: %s", e)
+        err_str = str(e)
+        if "Maximum amount of tokens" in err_str:
+            msg = (
+                "⚠️ <b>Cazad API: tokenlar limiti to'ldi</b>\n\n"
+                "Cazad admin panelida keraksiz tokenlarni o'chirib, "
+                "qayta urinib ko'ring.\n\n"
+                f"<code>{err_str[:300]}</code>"
+            )
+        else:
+            msg = f"⚠️ API xatosi:\n<code>{err_str[:500]}</code>"
+        await progress.edit_text(msg)
         return
 
     xls_buffer = _build_xls(numbers)
